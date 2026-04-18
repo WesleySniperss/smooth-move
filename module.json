@@ -1,0 +1,12 @@
+{
+  "id": "smooth-move",
+  "title": "Smooth Move",
+  "description": "White measurement line with dots every 5 ft while dragging. Right-click to anchor waypoints. Smooth path-following animation on drop.",
+  "version": "2.0.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "esmodules": ["smooth-move.js"],
+  "authors": [{ "name": "Vlad" }]
+}
