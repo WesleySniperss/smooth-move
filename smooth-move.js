@@ -45,12 +45,44 @@ Hooks.once("setup", () => {
     }
 
     _onUpdate(data, options, userId) {
-      super._onUpdate(data, options, userId);
+      // Case 1: finishing our own local drag — document is updated, sync visuals
       if (this._smCommitting) {
+        super._onUpdate(data, options, userId);
         delete this._smCommitting;
         canvas.tokens?.recalculatePlannedMovementPaths?.();
         syncPosAndPerception(this);
+        return;
       }
+
+      // Case 2: position update sent by another client with animate:false
+      // (smooth-move always sends animate:false, so other clients need to animate themselves)
+      const hasPos = data.x != null || data.y != null;
+      if (hasPos && !this._smActive && options?.animate === false) {
+        const startX = this.mesh?.position.x;
+        const startY = this.mesh?.position.y;
+
+        super._onUpdate(data, options, userId); // updates document, snaps mesh to new pos
+
+        const w = this.w ?? 0, h = this.h ?? 0;
+        const wps = options?.movement?.[this.id]?.waypoints;
+        let pts;
+        if (wps?.length >= 2) {
+          pts = wps.map(wp => ({ x: wp.x + w/2, y: wp.y + h/2 }));
+          if (startX != null) pts[0] = { x: startX, y: startY };
+        } else {
+          const endX = (data.x ?? this.document.x) + w/2;
+          const endY = (data.y ?? this.document.y) + h/2;
+          if (startX == null || (Math.abs(startX - endX) < 2 && Math.abs(startY - endY) < 2)) return;
+          pts = [{ x: startX, y: startY }, { x: endX, y: endY }];
+        }
+        if (pts.length >= 2) {
+          if (this.mesh) this.mesh.position.set(pts[0].x, pts[0].y);
+          animate(this, pts, getMoveMode(this)).catch(() => {});
+        }
+        return;
+      }
+
+      super._onUpdate(data, options, userId);
     }
 
     _onDragLeftStart(event, ...args) {
