@@ -8,5 +8,7 @@
     "verified": "13"
   },
   "esmodules": ["smooth-move.js"],
-  "authors": [{ "name": "Vlad" }]
+  "authors": [{ "name": "Vlad" }],
+  "manifest": "https://raw.githubusercontent.com/WesleySniperss/smooth-move/master/module.json",
+  "download": "https://github.com/WesleySniperss/smooth-move/archive/refs/heads/master.zip"
 }
