@@ -610,72 +610,233 @@ async function animate(token, waypoints, mode) {
 }
 
 // ─── Fly effect system ───────────────────────────────────────────────────────
+const _TAU = Math.PI * 2;
 const _lerp = (a, b, t) => a + (b - a) * t;
+const _easeOut = t => 1 - Math.pow(1 - t, 2.5);
 
 const _FLY_CFG = {
-  vortexRadius: 50,    // px from token center
-  vortexSpeed:  0.45,  // rad/s — slow, peaceful rotation
-  vortexAlpha:  0.55,  // peak alpha of the ring band
+  ringRateMs:    1200,
+  ringLifeMs:    1600,
+  ringMaxR:      55,
+  ringParticles: 40,
+  ringSquashY:   0.55,
+  flapMs:        380,
+  puffLifeMs:    1000,
+  puffSize:      26,
+  wingOffsetPx:  14,
+  wingBackPx:    4,
+  puffOutSpeed:  0.6,
+  puffDrag:      0.94,
+  moveThreshold: 0.8,
+  smoothFactor:  0.2,
+  maxPuffsTotal: 200,
+  maxRingsTotal: 16,
+  zIndex:        200,
+  colorCore:     [220, 235, 255],
+  colorMid:      [180, 210, 240],
+  colorEdge:     [140, 180, 220],
+  alphaMax:      0.9,
 };
 
-// Draw a soft ring (continuous stroke band, not dots) centred at cx,cy
-function _drawVortexRing(gfx, cx, cy, R, rotAngle, alpha) {
-  // 3-band soft glow: inner edge → peak → outer edge
-  const bands = [
-    { dr: -7, lw: 4, a: 0.20 },
-    { dr:  0, lw: 6, a: 0.45 },
-    { dr: +7, lw: 4, a: 0.20 },
-  ];
-  for (const b of bands) {
-    gfx.lineStyle(b.lw, 0xd8eeff, b.a * alpha);
-    gfx.drawCircle(cx, cy, R + b.dr);
-    gfx.lineStyle(0);
-  }
+function _mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
 
-  // Two diametrically-opposite bright arc "streaks" that rotate to show swirl
-  const arcLen = Math.PI * 0.40;
-  for (const off of [0, Math.PI]) {
-    const a0 = rotAngle + off;
-    const a1 = a0 + arcLen;
-    // Outer glow
-    gfx.lineStyle(5, 0xe8f6ff, 0.18 * alpha);
-    gfx.moveTo(cx + Math.cos(a0) * (R + 4), cy + Math.sin(a0) * (R + 4));
-    gfx.arc(cx, cy, R + 4, a0, a1);
-    gfx.lineStyle(0);
-    // Core bright streak
-    gfx.lineStyle(4, 0xdcedff, 0.55 * alpha);
-    gfx.moveTo(cx + Math.cos(a0) * R, cy + Math.sin(a0) * R);
-    gfx.arc(cx, cy, R, a0, a1);
-    gfx.lineStyle(0);
+function _pixiRender(renderer, gfx, rt) {
+  try        { renderer.render({ container: gfx, target: rt }); }
+  catch (_)  {
+    try      { renderer.render(gfx, rt); }
+    catch(_2){ renderer.render({ container: gfx, renderTexture: rt }); }
   }
 }
 
+function _bakeBlobTexture(renderer, size = 64) {
+  const c = size / 2;
+  const g = new PIXI.Graphics();
+  const [r0,g0,b0] = _FLY_CFG.colorCore, [r1,g1,b1] = _FLY_CFG.colorMid, [r2,g2,b2] = _FLY_CFG.colorEdge;
+  for (let i = 12; i >= 1; i--) {
+    const t = i / 12;
+    let cr, cg, cb, ca;
+    if (t < 0.4) {
+      const k = t / 0.4;
+      cr = _lerp(r0,r1,k); cg = _lerp(g0,g1,k); cb = _lerp(b0,b1,k); ca = _lerp(0.55,0.35,k);
+    } else {
+      const k = (t-0.4)/0.6;
+      cr = _lerp(r1,r2,k); cg = _lerp(g1,g2,k); cb = _lerp(b1,b2,k); ca = _lerp(0.35,0,k);
+    }
+    g.beginFill((Math.round(cr)<<16)|(Math.round(cg)<<8)|Math.round(cb), ca);
+    g.drawCircle(c, c, c * t);
+    g.endFill();
+  }
+  const rt = PIXI.RenderTexture.create({ width: size, height: size });
+  _pixiRender(renderer, g, rt);
+  g.destroy();
+  return rt;
+}
+
+function _bakePuffTexture(renderer, seed, size = 128) {
+  const rand = _mulberry32(seed);
+  const c = size / 2, R = size * 0.38;
+  const N = 10 + Math.floor(rand() * 5);
+  const g = new PIXI.Graphics();
+  const [r0,g0,b0] = _FLY_CFG.colorCore, [r1,g1,b1] = _FLY_CFG.colorMid, [r2,g2,b2] = _FLY_CFG.colorEdge;
+  for (let i = 0; i < N; i++) {
+    const a = rand()*_TAU, d = rand()*R*0.7;
+    const bx = c+Math.cos(a)*d, by = c+Math.sin(a)*d*0.75;
+    const br = R*(0.35+rand()*0.3), ba = 0.4+rand()*0.4;
+    for (let j = 8; j >= 1; j--) {
+      const t = j/8;
+      let cr, cg, cb, ca;
+      if (t < 0.4) {
+        const k=t/0.4; cr=_lerp(r0,r1,k); cg=_lerp(g0,g1,k); cb=_lerp(b0,b1,k); ca=_lerp(0.55,0.30,k)*ba;
+      } else {
+        const k=(t-0.4)/0.6; cr=_lerp(r1,r2,k); cg=_lerp(g1,g2,k); cb=_lerp(b1,b2,k); ca=_lerp(0.30,0,k)*ba;
+      }
+      g.beginFill((Math.round(cr)<<16)|(Math.round(cg)<<8)|Math.round(cb), ca);
+      g.drawCircle(bx, by, br*t);
+      g.endFill();
+    }
+  }
+  const rt = PIXI.RenderTexture.create({ width: size, height: size });
+  _pixiRender(renderer, g, rt);
+  g.destroy();
+  return rt;
+}
+
+class _Ring {
+  constructor() { this.particles=[]; this.cx=0; this.cy=0; this.age=0; this.life=0; this.maxR=0; this.squashY=0; this.tilt=0; }
+
+  reset(cx, cy, blobTex, container) {
+    this.cx=cx; this.cy=cy; this.age=0;
+    this.life    = _FLY_CFG.ringLifeMs * (0.85 + Math.random()*0.3);
+    this.maxR    = _FLY_CFG.ringMaxR   * (0.9  + Math.random()*0.2);
+    this.squashY = _FLY_CFG.ringSquashY + (Math.random()-0.5)*0.15;
+    this.tilt    = (Math.random()-0.5)*0.3;
+    this.particles.length = 0;
+    const N = _FLY_CFG.ringParticles;
+    for (let i = 0; i < N; i++) {
+      const a = (i/N)*_TAU + (Math.random()-0.5)*0.15;
+      if (Math.random() < 0.3) continue;
+      const spr = new PIXI.Sprite(blobTex);
+      spr.anchor.set(0.5);
+      container.addChild(spr);
+      this.particles.push({ baseAngle:a, radOff:(Math.random()-0.5)*0.25, driftMul:0.85+Math.random()*0.3, size:0.75+Math.random()*0.6, alphaMul:0.5+Math.random()*0.5, spr });
+    }
+  }
+
+  update(dt) {
+    this.age += dt;
+    if (this.age >= this.life) { this.destroy(); return false; }
+    const t = this.age / this.life;
+    const R = this.maxR * (1 - Math.pow(1-t, 2.2));
+    const env = Math.min(t/0.12, 1) * (1 - Math.pow(t, 1.5));
+    const baseA = env * _FLY_CFG.alphaMax;
+    const grow  = 1 + t * 1.5;
+    for (const p of this.particles) {
+      const finalR = R*(1+p.radOff*p.driftMul) + t*8*p.driftMul;
+      p.spr.x = this.cx + Math.cos(p.baseAngle+this.tilt) * finalR;
+      p.spr.y = this.cy + Math.sin(p.baseAngle+this.tilt) * finalR * this.squashY;
+      const sz = 14 * p.size * grow;
+      p.spr.width = p.spr.height = sz;
+      p.spr.alpha = baseA * p.alphaMul;
+    }
+    return true;
+  }
+
+  destroy() {
+    for (const p of this.particles) { p.spr.parent?.removeChild(p.spr); p.spr.destroy(); }
+    this.particles.length = 0;
+  }
+}
 
 const _fly = {
-  gfx:        null,
-  tokenState: new Map(),  // id → { prevX, prevY, smoothSpeed, rotAngle }
-  _tickFn:    null,
+  _container:  null,
+  _blobTex:    null,
+  _puffTexs:   [],
+  _tokenState: new Map(),
+  _puffs:      [],
+  _puffPool:   [],
+  _rings:      [],
+  _tickFn:     null,
 
   init() {
-    if (this.gfx) return;
-    this.gfx = new PIXI.Graphics();
-    this.gfx.zIndex = 200;
+    if (this._container) return;
+    const renderer = canvas.app.renderer;
+    this._blobTex = _bakeBlobTexture(renderer, 64);
+    for (let i = 0; i < 6; i++) this._puffTexs.push(_bakePuffTexture(renderer, 7+i*13, 128));
+    this._container = new PIXI.Container();
+    this._container.zIndex = _FLY_CFG.zIndex;
     const parent = canvas.primary ?? canvas.stage;
-    parent.addChild(this.gfx);
+    parent.addChild(this._container);
     if (parent.sortableChildren !== undefined) parent.sortableChildren = true;
-    this._tickFn = () => this._tick();
+    this._tickFn = (ticker) => this._tick(ticker);
     canvas.app.ticker.add(this._tickFn);
   },
 
   destroy() {
     if (this._tickFn) { canvas.app.ticker.remove(this._tickFn); this._tickFn = null; }
-    this.gfx?.destroy(); this.gfx = null;
-    this.tokenState.clear();
+    for (const r of this._rings) r.destroy();
+    this._rings.length = 0;
+    for (const spr of this._puffs) { spr.parent?.removeChild(spr); spr.destroy(); }
+    for (const spr of this._puffPool) spr.destroy();
+    this._puffs.length = 0; this._puffPool.length = 0;
+    this._tokenState.clear();
+    this._container?.destroy({ children: true }); this._container = null;
+    this._blobTex?.destroy(true); this._blobTex = null;
+    for (const t of this._puffTexs) t.destroy(true);
+    this._puffTexs.length = 0;
   },
 
-  _tick() {
-    if (!this.gfx) return;
-    const dt     = canvas.app.ticker.deltaMS ?? 16;
+  _borrowPuff() {
+    let spr = this._puffPool.pop();
+    const tex = this._puffTexs[Math.floor(Math.random()*this._puffTexs.length)];
+    if (!spr) { spr = new PIXI.Sprite(tex); spr.anchor.set(0.5); }
+    else spr.texture = tex;
+    spr.visible = true;
+    this._container.addChild(spr);
+    return spr;
+  },
+
+  _releasePuff(spr) {
+    spr.visible = false;
+    spr.parent?.removeChild(spr);
+    if (this._puffPool.length < 100) this._puffPool.push(spr);
+    else spr.destroy();
+  },
+
+  _emitWingPair(x, y, dx, dy) {
+    if (this._puffs.length + 2 > _FLY_CFG.maxPuffsTotal) return;
+    const len = Math.hypot(dx,dy)||1, fx=dx/len, fy=dy/len, px=-fy, py=fx;
+    for (const side of [-1,1]) {
+      const sx = x - fx*_FLY_CFG.wingBackPx + px*_FLY_CFG.wingOffsetPx*side;
+      const sy = y - fy*_FLY_CFG.wingBackPx + py*_FLY_CFG.wingOffsetPx*side;
+      const outSpd = _FLY_CFG.puffOutSpeed + Math.random()*0.3;
+      const spr = this._borrowPuff();
+      spr.x = sx+(Math.random()-0.5)*3; spr.y = sy+(Math.random()-0.5)*3;
+      spr.rotation = (Math.random()-0.5)*0.4; spr.alpha = 0;
+      spr.__data = { vx:px*side*outSpd+(Math.random()-0.5)*0.1, vy:py*side*outSpd+0.15+Math.random()*0.1,
+        age:0, life:_FLY_CFG.puffLifeMs*(0.9+Math.random()*0.3),
+        maxR:_FLY_CFG.puffSize*(0.55+Math.random()*0.35), rotV:(Math.random()-0.5)*0.001 };
+      this._puffs.push(spr);
+    }
+  },
+
+  _spawnRing(x, y) {
+    if (this._rings.length >= _FLY_CFG.maxRingsTotal) return;
+    const r = new _Ring();
+    r.reset(x, y, this._blobTex, this._container);
+    this._rings.push(r);
+  },
+
+  _tick(ticker) {
+    if (!this._container) return;
+    const dt  = ticker?.deltaMS ?? (canvas.app.ticker.deltaMS ?? 16);
+    const now = performance.now();
     const tokens = canvas.tokens?.placeables ?? [];
     const liveIds = new Set();
 
@@ -685,31 +846,45 @@ const _fly = {
       const id = token.id;
       liveIds.add(id);
       const mx = mesh.x, my = mesh.y;
-
-      let st = this.tokenState.get(id);
+      let st = this._tokenState.get(id);
       if (!st) {
-        st = { prevX: mx, prevY: my, smoothSpeed: 0, rotAngle: Math.random() * Math.PI * 2 };
-        this.tokenState.set(id, st);
+        this._tokenState.set(id, { prevX:mx, prevY:my, smoothSpeed:0, flapPhase:0, wasPeak:false, lastRingTs:0 });
         continue;
       }
-
-      st.prevX = mx; st.prevY = my;
-      if ((token.document?.elevation ?? 0) <= 0) continue;
-      st.rotAngle += _FLY_CFG.vortexSpeed * (dt / 1000);
+      const ddx = mx-st.prevX, ddy = my-st.prevY;
+      st.smoothSpeed = _lerp(st.smoothSpeed, Math.hypot(ddx,ddy), _FLY_CFG.smoothFactor);
+      st.prevX=mx; st.prevY=my;
+      if ((token.document?.elevation??0) <= 0) continue;
+      if (st.smoothSpeed > _FLY_CFG.moveThreshold) {
+        st.flapPhase += dt / _FLY_CFG.flapMs;
+        const peak = Math.sin(st.flapPhase*_TAU) > 0.85;
+        if (peak && !st.wasPeak) this._emitWingPair(mx, my, ddx, ddy);
+        st.wasPeak = peak;
+      } else {
+        st.wasPeak = false;
+        if (now - st.lastRingTs > _FLY_CFG.ringRateMs) { this._spawnRing(mx,my); st.lastRingTs=now; }
+      }
     }
 
-    for (const id of [...this.tokenState.keys()]) {
-      if (!liveIds.has(id)) this.tokenState.delete(id);
-    }
+    if (this._tokenState.size > liveIds.size)
+      for (const id of [...this._tokenState.keys()]) if (!liveIds.has(id)) this._tokenState.delete(id);
 
-    this.gfx.clear();
+    for (let i = this._rings.length-1; i >= 0; i--)
+      if (!this._rings[i].update(dt)) this._rings.splice(i,1);
 
-    for (const token of tokens) {
-      const mesh = token.mesh;
-      if (!mesh || (token.document?.elevation ?? 0) <= 0) continue;
-      const st = this.tokenState.get(token.id);
-      if (!st) continue;
-      _drawVortexRing(this.gfx, mesh.x, mesh.y, _FLY_CFG.vortexRadius, st.rotAngle, _FLY_CFG.vortexAlpha);
+    const drag = Math.pow(_FLY_CFG.puffDrag, dt/16);
+    for (let i = this._puffs.length-1; i >= 0; i--) {
+      const spr = this._puffs[i], d = spr.__data;
+      d.age += dt;
+      if (d.age >= d.life) { this._puffs.splice(i,1); this._releasePuff(spr); continue; }
+      const t = d.age/d.life;
+      const size  = _lerp(d.maxR*0.5, d.maxR*2.0, _easeOut(Math.min(t*1.6,1)));
+      const alpha = t < 0.12 ? _lerp(0,1,t/0.12) : _lerp(1,0,(t-0.12)/0.88);
+      spr.x += d.vx*(dt/16); spr.y += d.vy*(dt/16);
+      d.vx *= drag; d.vy *= drag;
+      spr.rotation += d.rotV*dt;
+      spr.width=size*1.15; spr.height=size*0.9;
+      spr.alpha = alpha * _FLY_CFG.alphaMax;
     }
   },
 };
