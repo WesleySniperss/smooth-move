@@ -565,8 +565,7 @@ function spawnDirtChunk(layer, x, y, _dirX, _dirY, tr, underground) {
 const PROFILES = {
   walk:   { kind: "walk",   mult: 1.0 },
   fly:    { kind: "cont",   mult: 1.0, ease: eio4,
-            scale: t => 1 + 0.10 * Math.sin(Math.PI * t),
-            burstEffect: spawnFlyBurst },
+            scale: t => 1 + 0.10 * Math.sin(Math.PI * t) },
   swim:   { kind: "cont",   mult: 2.0, ease: eio,
             ox: (t, gs) => Math.sin(t * Math.PI * 4) * gs * 0.07,
             oy: (t, gs) => Math.sin(t * Math.PI * 8) * gs * 0.035,
@@ -591,6 +590,15 @@ async function animate(token, waypoints, mode) {
   const gs   = canvas.grid.size ?? 100;
   const bsx  = token.mesh?.scale?.x ?? 1;
   const bsy  = token.mesh?.scale?.y ?? 1;
+  const tr   = Math.min(token.w ?? 50, token.h ?? 50) / 2;
+
+  // Takeoff cloud burst for elevated tokens
+  const elevated = (token.document?.elevation ?? 0) > 0;
+  let burstLayer = null;
+  if (elevated) {
+    burstLayer = makeParticleLayer();
+    spawnFlyBurst(burstLayer, waypoints[0].x, waypoints[0].y, tr);
+  }
 
   token._smActive = true;
   try {
@@ -606,6 +614,12 @@ async function animate(token, waypoints, mode) {
     if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = 0; token.mesh.scale.set(bsx, bsy); }
     syncPosAndPerception(token);
     delete token._smActive;
+    // Landing cloud burst
+    if (elevated && burstLayer) {
+      const last = waypoints[waypoints.length - 1];
+      spawnFlyBurst(burstLayer, last.x, last.y, tr);
+      setTimeout(() => burstLayer.destroy(), 2000);
+    }
   }
 }
 
