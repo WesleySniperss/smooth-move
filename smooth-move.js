@@ -115,12 +115,13 @@ Hooks.once("setup", () => {
       const startPx = this._smStartPx;
       if (!startPx) return super._onDragLeftDrop(event, ...args);
 
+      // Only the first selected token to drop handles the group — others are animated via _onUpdate
+      if (this.layer?._smGroupDrop) { delete this._smStartPx; return; }
+
       if ((game.settings.get(MODULE_ID, "playersOnly") ?? false) && !this.actor?.hasPlayerOwner) {
         delete this._smStartPx;
         return super._onDragLeftDrop(event, ...args);
       }
-
-      const mode = getMoveMode(this);
 
       let tokenUpdates, updateOptions;
       try {
@@ -131,51 +132,61 @@ Hooks.once("setup", () => {
 
       if (!tokenUpdates?.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
 
-      const movementData = updateOptions?.movement?.[this.id];
-      const allWPs       = movementData?.waypoints;
-      if (!allWPs?.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
+      // Build animation jobs for every token in this group move
+      const jobs = [];
+      for (const upd of tokenUpdates) {
+        const tid = upd._id ?? upd.id;
+        const t   = tid === this.id ? this : canvas.tokens?.get(tid);
+        if (!t?.mesh) continue;
+        const tStart = t._smStartPx ?? { x: t.mesh.position.x, y: t.mesh.position.y };
+        delete t._smStartPx;
+        const tWPs = updateOptions?.movement?.[tid]?.waypoints;
+        if (!tWPs?.length) continue;
+        const tw = t.w ?? 0, th = t.h ?? 0;
+        const meshWPs = tWPs.map(wp => ({ x: wp.x + tw/2, y: wp.y + th/2 }));
+        const first   = meshWPs[0];
+        const skip    = Math.abs(first.x - tStart.x) < 2 && Math.abs(first.y - tStart.y) < 2;
+        const raw     = skip ? [tStart, ...meshWPs.slice(1)] : [tStart, ...meshWPs];
+        const tMode   = getMoveMode(t);
+        const pts     = (tMode === "walk" || tMode === "climb") ? expandToGridCells(raw, t) : raw;
+        jobs.push({ token: t, pts, mode: tMode, upd });
+      }
 
-      const w = this.w ?? 0, h = this.h ?? 0;
-      const toMeshPx = wp => ({ x: wp.x + w / 2, y: wp.y + h / 2 });
-      const meshWPs  = allWPs.map(toMeshPx);
+      if (!jobs.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
 
-      const firstWP   = meshWPs[0];
-      const skipFirst = Math.abs(firstWP.x - startPx.x) < 2 && Math.abs(firstWP.y - startPx.y) < 2;
-      const rawPts    = skipFirst ? [startPx, ...meshWPs.slice(1)] : [startPx, ...meshWPs];
-      const pts       = (mode === "walk" || mode === "climb") ? expandToGridCells(rawPts, this) : rawPts;
-
-      delete this._smStartPx;
-      const token           = this;
       const capturedUpdates = tokenUpdates;
       const capturedOptions = updateOptions;
+      this.layer._smGroupDrop = true;
 
       (async () => {
-        token.layer?.clearPreviewContainer?.();
-        if (token.mesh) token.mesh.position.set(startPx.x, startPx.y);
+        this.layer?.clearPreviewContainer?.();
+        for (const j of jobs) if (j.token.mesh) j.token.mesh.position.set(j.pts[0].x, j.pts[0].y);
 
-        await animate(token, pts, mode);
+        await Promise.all(jobs.map(j => animate(j.token, j.pts, j.mode)));
 
-        const origMov = capturedOptions?.movement?.[token.id] ?? {};
-        const finalWP = origMov.waypoints?.at(-1) ?? capturedUpdates[0];
-        const commitMovement = { [token.id]: { ...origMov, waypoints: [finalWP] } };
-
-        token._smCommitting = true;
-        const _commitGuard = setTimeout(() => { delete token._smCommitting; }, 500);
+        // Build commit movement for all tokens
+        const commitMovement = {};
+        for (const j of jobs) {
+          const origMov = capturedOptions?.movement?.[j.token.id] ?? {};
+          commitMovement[j.token.id] = { ...origMov, waypoints: [origMov.waypoints?.at(-1) ?? j.upd] };
+          j.token._smCommitting = true;
+          setTimeout(() => { delete j.token._smCommitting; }, 500);
+        }
 
         await canvas.scene?.updateEmbeddedDocuments("Token", capturedUpdates,
           { animate: false, panCamera: false, movement: commitMovement });
 
-        clearTimeout(_commitGuard);
-
-        // Snap to the authoritative document position (server may have adjusted it)
-        if (token.mesh) {
-          const docX = token.document?.x ?? capturedUpdates[0]?.x;
-          const docY = token.document?.y ?? capturedUpdates[0]?.y;
-          if (docX != null) token.mesh.position.set(docX + (token.w ?? 0) / 2, docY + (token.h ?? 0) / 2);
+        for (const j of jobs) {
+          const t = j.token;
+          if (t.mesh) {
+            const docX = t.document?.x ?? j.upd.x;
+            const docY = t.document?.y ?? j.upd.y;
+            if (docX != null) t.mesh.position.set(docX + (t.w ?? 0)/2, docY + (t.h ?? 0)/2);
+          }
+          delete t.x; delete t.y;
         }
-        delete token.x;
-        delete token.y;
-      })().catch(err => console.error("[smooth-move] animation error:", err));
+      })().catch(err => console.error("[smooth-move] animation error:", err))
+        .finally(() => { this.layer._smGroupDrop = false; });
     }
   }
 
