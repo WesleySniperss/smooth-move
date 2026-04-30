@@ -1329,11 +1329,23 @@ class TokenEffects {
     const now = performance.now();
 
     if (this._darkFilters) {
-      const darkness   = canvas.scene?.darkness ?? 0;
-      const brightness = Math.max(0.1, 1 - darkness);
-      for (const f of this._darkFilters) {
-        if (typeof f.brightness === 'function') f.brightness(brightness, false);
-        else { f.matrix = [brightness,0,0,0,0, 0,brightness,0,0,0, 0,0,brightness,0,0, 0,0,0,1,0]; }
+      const darkness = canvas.scene?.darkness ?? 0;
+      if (darkness !== this._lastDarkness) {
+        this._lastDarkness = darkness;
+        const containers = Object.values(this.containers);
+        if (darkness <= 0) {
+          // No darkness — remove filters entirely (saves 3 render passes per frame)
+          for (const c of containers) c.filters = null;
+        } else {
+          const brightness = Math.max(0.1, 1 - darkness);
+          let i = 0;
+          for (const c of containers) {
+            if (!c.filters?.length) c.filters = [this._darkFilters[i]];
+            const f = this._darkFilters[i++];
+            if (typeof f.brightness === 'function') f.brightness(brightness, false);
+            else { f.matrix = [brightness,0,0,0,0, 0,brightness,0,0,0, 0,0,brightness,0,0, 0,0,0,1,0]; }
+          }
+        }
       }
     }
 
