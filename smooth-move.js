@@ -11,11 +11,6 @@ Hooks.once("init", () => {
     scope: "client", config: true,
     type: Number, default: 900, range: { min: 0, max: 3000, step: 50 },
   });
-  game.settings.register(MODULE_ID, "stepSound", {
-    name: "Walking step sounds",
-    scope: "client", config: true,
-    type: Boolean, default: true,
-  });
   game.settings.register(MODULE_ID, "playersOnly", {
     name: "Animate player tokens only",
     hint: "When enabled, NPC tokens move instantly without animation.",
@@ -202,10 +197,10 @@ Hooks.once("ready", () => {
       delete token._smStartPx;
     }
   }, { capture: true });
-  Hooks.on("canvasReady",    () => { for (const t of canvas.tokens?.placeables ?? []) delete t._smStartPx; _fly.destroy(); _fly.init(); });
-  Hooks.on("canvasTearDown", () => _fly.destroy());
-  // canvasReady fires before ready, so init immediately if canvas is already up
-  if (canvas?.ready) _fly.init();
+  Hooks.on("canvasReady",    () => { for (const t of canvas.tokens?.placeables ?? []) delete t._smStartPx; TokenEffects.instance.destroy(); TokenEffects.instance.init(); });
+  Hooks.on("canvasTearDown", () => TokenEffects.instance.destroy());
+  Hooks.on("deleteToken",    (doc) => TokenEffects.instance._dropToken(doc.id));
+  if (canvas?.ready) TokenEffects.instance.init();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -217,17 +212,7 @@ const eio4  = t => t < 0.5 ? 8*t*t*t*t : 1 - 8*(1-t)*(1-t)*(1-t)*(1-t);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const animMs = () => game.settings.get(MODULE_ID, "animMs") ?? 900;
 
-const STEP_SOUNDS = [
-  "modules/aeris-tokens/assets/sfx_step_grass_l.ogg",
-  "modules/aeris-tokens/assets/sfx_step_grass_r.ogg",
-];
-function playStepSound(i) {
-  try {
-    if (!game.settings.get(MODULE_ID, "stepSound")) return;
-    const vol = Number(game.settings?.storage?.get("client")?.["core.globalInterfaceVolume"] ?? "1");
-    game.audio?.play(STEP_SOUNDS[i % 2], { volume: vol * 0.5 });
-  } catch (_) {}
-}
+function playStepSound(_i) {}
 
 function syncPos(token) {
   const mesh = token.mesh;
@@ -275,39 +260,10 @@ function expandToGridCells(pts, token) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Particle system
+// Particle system (for swim / teleport / climb effects)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Generates unit-scale polygon vertices for an irregular chunk.
- * Scale at draw time by multiplying by current radius.
- */
-function makeChunkVerts(n = 6) {
-  const v = [];
-  for (let i = 0; i < n; i++) {
-    const a = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * (Math.PI / n) * 1.3;
-    const d = 0.5 + Math.random() * 0.6;
-    v.push([Math.cos(a) * d, Math.sin(a) * d]);
-  }
-  return v;
-}
 
-/**
- * Particle properties:
- *   x, y, vx, vy  — position & velocity (px/frame)
- *   r0, r1         — start/end radius
- *   drag           — per-frame velocity retention (e.g. 0.88^(1/60) → 0.88 after 1 s at 60 fps)
- *   color          — PIXI hex
- *   alpha          — peak opacity
- *   life, age      — seconds
- *   ring, lw       — draw as circle outline instead of fill
- *   shape          — 'circle' | 'ellipse' | 'streak' | 'poly'
- *   rotV           — rotation velocity (rad/frame), for poly
- *   rot            — current rotation (rad)
- *   verts          — unit polygon verts [[x,y]…], for poly
- *   sdx, sdy       — initial dir (normalised), for streak
- *   rx, ry         — ellipse half-radii relative to r, for ellipse
- */
 function makeParticleLayer() {
   const gfx = new PIXI.Graphics();
   canvas.stage.addChild(gfx);
@@ -319,13 +275,12 @@ function makeParticleLayer() {
       const p = ps[i];
       p.age += dt;
       if (p.age >= p.life) { ps.splice(i, 1); continue; }
-      // Trail particles: velocity direction evolves over lifetime via curve
       if (p.shape === 'trail' && p.ang0 !== undefined) {
         const lt  = clamp(p.age / p.life, 0, 1);
-        const ea  = lt < 0.5 ? 2*lt*lt : -1+(4-2*lt)*lt; // ease in-out
+        const ea  = lt < 0.5 ? 2*lt*lt : -1+(4-2*lt)*lt;
         const ang = p.ang0 + (p.ang1 - p.ang0) * ea
                   + Math.sin(lt * (p.oscF ?? 5) + (p.oscPh ?? 0)) * (p.oscA ?? 0.35);
-        const spd = (p.spd ?? 80) * (1 - lt * 0.5); // gradually decelerates
+        const spd = (p.spd ?? 80) * (1 - lt * 0.5);
         p.vx = Math.cos(ang) * spd;
         p.vy = Math.sin(ang) * spd;
       }
@@ -334,7 +289,6 @@ function makeParticleLayer() {
       const df = Math.pow(p.drag, dt * 60);
       p.vx *= df; p.vy *= df;
       if (p.rotV) p.rot = (p.rot ?? 0) + p.rotV;
-      // Record position history for trail rendering
       if (p.shape === 'trail') {
         if (!p.hist) p.hist = [];
         p.hist.push({ x: p.x, y: p.y });
@@ -370,12 +324,10 @@ function makeParticleLayer() {
         gfx.beginFill(p.color, a);
         gfx.drawPolygon(pts);
         gfx.endFill();
-        // edge highlight
         gfx.lineStyle(0.7, p.color + 0x303010, a * 0.4);
         gfx.drawPolygon(pts);
         gfx.lineStyle(0);
       } else if (shape === 'windstreak' && p.p0) {
-        // Growing animated bezier streaks with flutter
         const growT  = Math.min(1, p.age / (p.life * 0.40));
         const flutter = Math.sin(p.age * 20 + (p.phase ?? 0)) * (p.fm ?? 0) * (1 - tf) * 0.8;
         const qx = (p0, cp, p1, t) => (1-t)*(1-t)*p0 + 2*(1-t)*t*cp + t*t*p1;
@@ -418,7 +370,6 @@ function makeParticleLayer() {
         }
         gfx.lineStyle(0);
       } else if (p.soft) {
-        // Soft radial gradient blob: concentric ellipses outer→inner
         const sy = p.squash ?? 0.85;
         for (let s = 3; s >= 1; s--) {
           const rs = r * (s / 3);
@@ -450,30 +401,6 @@ function makeParticleLayer() {
 
 // ─── Spawners ────────────────────────────────────────────────────────────────
 
-// tr = token half-size (radius), used to spread spawn across the token area.
-
-function spawnWalkDust(layer, x, y, dirX, dirY, tr) {
-  const r   = tr ?? 30;
-  const bAng = Math.atan2(-dirY, -dirX);
-  const count = 4 + Math.floor(Math.random() * 4);
-  for (let i = 0; i < count; i++) {
-    const ang = bAng + (Math.random() - 0.5) * 1.7;
-    const spd = (30 + Math.random() * 55) / 60;
-    // spawn from back half of the token footprint
-    const ox = x - dirX * r * (0.2 + Math.random() * 0.8) + (Math.random() - 0.5) * r * 1.2;
-    const oy = y - dirY * r * (0.2 + Math.random() * 0.8) + (Math.random() - 0.5) * r * 1.2;
-    layer.spawn({
-      x: ox, y: oy,
-      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd,
-      r0: 1.8 + Math.random() * 2.5, r1: 0,
-      color: 0xc4a882, alpha: 0.55 + Math.random() * 0.3,
-      life: 0.22 + Math.random() * 0.2,
-      drag: Math.pow(0.85, 1/60),
-      shape: 'circle',
-    });
-  }
-}
-
 function spawnSwimBubble(layer, x, y, dirX, dirY, tr) {
   if (Math.random() > 0.55) return;
   const r    = tr ?? 30;
@@ -483,7 +410,6 @@ function spawnSwimBubble(layer, x, y, dirX, dirY, tr) {
     const ang  = bAng + (Math.random() - 0.5) * 2.0;
     const spd  = (8 + Math.random() * 18) / 60;
     const sz   = 3 + Math.random() * 5;
-    // spawn from anywhere inside the token circle
     const a2 = Math.random() * Math.PI * 2;
     const d2 = Math.random() * r * 0.9;
     layer.spawn({
@@ -494,66 +420,6 @@ function spawnSwimBubble(layer, x, y, dirX, dirY, tr) {
       life: 0.65 + Math.random() * 0.55,
       drag: Math.pow(0.96, 1/60),
       ring: true, lw: 1.2,
-    });
-  }
-}
-
-// Burst of soft air blobs at takeoff / landing
-function spawnFlyBurst(layer, x, y, tr) {
-  const r    = Math.max(tr ?? 30, 25);
-  const n    = 32;
-  const drag = Math.pow(0.91, 1 / 60);
-  const sq   = 0.55;
-
-  for (let i = 0; i < n; i++) {
-    const ang    = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
-    const radSpd = (30 + Math.random() * 28) / 60;
-    const tanSpd = (12 + Math.random() * 14) / 60;
-    const tanDir = Math.random() > 0.5 ? 1 : -1;
-    const dist   = r * (0.2 + Math.random() * 0.35);
-    layer.spawn({
-      x: x + Math.cos(ang) * dist,
-      y: y + Math.sin(ang) * dist * sq,
-      vx: Math.cos(ang) * radSpd + Math.cos(ang + Math.PI * 0.5) * tanSpd * tanDir,
-      vy: Math.sin(ang) * radSpd * sq + Math.sin(ang + Math.PI * 0.5) * tanSpd * tanDir * sq,
-      drag,
-      r0: r * (0.10 + Math.random() * 0.10),
-      r1: r * (0.25 + Math.random() * 0.20),
-      color: 0xdcedff,
-      alpha: 0.32 + Math.random() * 0.20,
-      life:  0.55 + Math.random() * 0.40,
-      soft: true, squash: sq,
-      fadeIn: 0.10,
-    });
-  }
-}
-
-function spawnDirtChunk(layer, x, y, _dirX, _dirY, tr, underground) {
-  const r = tr ?? 30;
-  // More chunks and larger when underground
-  const base  = underground ? 4 : 2;
-  const count = base + Math.floor(Math.random() * (underground ? 4 : 3));
-  const DIRT  = [0x8B5E3C, 0x6B4226, 0x9E7050, 0x5C3A1E, 0xA0784A, 0x7A5030];
-
-  for (let i = 0; i < count; i++) {
-    const ang  = Math.random() * Math.PI * 2;
-    const spd  = ((underground ? 55 : 40) + Math.random() * 65) / 60;
-    const sz   = (underground ? 4 : 2.5) + Math.random() * (underground ? 5 : 4);
-    const c    = DIRT[Math.floor(Math.random() * DIRT.length)];
-    // spawn from across the full token footprint
-    const sa = Math.random() * Math.PI * 2;
-    const sd = Math.random() * r * 0.95;
-    layer.spawn({
-      x: x + Math.cos(sa)*sd, y: y + Math.sin(sa)*sd,
-      vx: Math.cos(ang)*spd, vy: Math.sin(ang)*spd,
-      r0: sz, r1: sz * 0.2,
-      color: c, alpha: underground ? 0.95 : 0.88,
-      life: (underground ? 0.55 : 0.45) + Math.random() * 0.4,
-      drag: Math.pow(0.87, 1/60),
-      shape: 'poly',
-      verts: makeChunkVerts(5 + Math.floor(Math.random() * 3)),
-      rot:   Math.random() * Math.PI * 2,
-      rotV:  (Math.random() - 0.5) * 0.12,
     });
   }
 }
@@ -572,9 +438,7 @@ const PROFILES = {
             effect: spawnSwimBubble, effectHz: 6 },
   climb:  { kind: "step",   mult: 1.2, ease: eio, pause: 80 },
   crawl:  { kind: "cont",   mult: 1.0, ease: eio },
-  burrow: { kind: "cont",   mult: 2.0, ease: eio,
-            alpha: t => 1 - Math.sin(t * Math.PI) * 0.82,
-            effect: spawnDirtChunk, effectHz: 4 },
+  burrow: { kind: "cont",   mult: 2.0, ease: eio },
   teleport: { kind: "teleport", mult: 0.8 },
   blink:    { kind: "teleport", mult: 0.8 },
   tp:       { kind: "teleport", mult: 0.8 },
@@ -592,329 +456,1014 @@ async function animate(token, waypoints, mode) {
   const bsy  = token.mesh?.scale?.y ?? 1;
   const tr   = Math.min(token.w ?? 50, token.h ?? 50) / 2;
 
-  // Takeoff cloud burst for elevated tokens
-  const elevated = (token.document?.elevation ?? 0) > 0;
-  let burstLayer = null;
-  if (elevated) {
-    burstLayer = makeParticleLayer();
-    spawnFlyBurst(burstLayer, waypoints[0].x, waypoints[0].y, tr);
-  }
-
+  const baseRot = token.mesh?.rotation ?? 0;
   token._smActive = true;
   try {
     if (prof.kind === "walk") {
       const steps   = waypoints.length - 1;
       const totalFt = steps * (canvas.grid.distance ?? 5);
-      await animWalk(token, waypoints, totalFt < 30 ? steps * 325 : 900, bsx, bsy);
+      token._smRunFt = totalFt;
+      await animWalk(token, waypoints, totalFt > 30 ? 1300 : 1000, bsx, bsy, baseRot);
     }
     else if (prof.kind === "step")     await animStep(token, waypoints, dur, prof);
     else if (prof.kind === "teleport") await animTeleport(token, waypoints, dur, bsx, bsy);
     else                               await animCont(token, waypoints, dur, prof, gs, bsx, bsy);
   } finally {
-    if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = 0; token.mesh.scale.set(bsx, bsy); }
+    if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
+    delete token._smRunFt;
     syncPosAndPerception(token);
     delete token._smActive;
-    // Landing cloud burst
-    if (elevated && burstLayer) {
-      const last = waypoints[waypoints.length - 1];
-      spawnFlyBurst(burstLayer, last.x, last.y, tr);
-      setTimeout(() => burstLayer.destroy(), 2000);
-    }
   }
 }
 
-// ─── Fly effect system ───────────────────────────────────────────────────────
-const _TAU = Math.PI * 2;
-const _lerp = (a, b, t) => a + (b - a) * t;
-const _easeOut = t => 1 - Math.pow(1 - t, 2.5);
+// ─── Token Effects (flight / run / burrow) ───────────────────────────────────
+const TAU     = Math.PI * 2;
+const lerp    = (a, b, t) => a + (b - a) * t;
+const easeOut = t => 1 - Math.pow(1 - t, 2.5);
 
-const _FLY_CFG = {
-  ringRateMs:    1200,
-  ringLifeMs:    1600,
-  ringMaxR:      55,
-  ringParticles: 40,
-  ringSquashY:   0.55,
-  flapMs:        380,
-  puffLifeMs:    1000,
-  puffSize:      26,
-  wingOffsetPx:  14,
-  wingBackPx:    4,
-  puffOutSpeed:  0.6,
-  puffDrag:      0.94,
-  moveThreshold: 0.8,
+const CFG = {
+  BRAKE_MIN_FEET: 30,
+  LAND_MIN_FEET:  30,
+  RUN_MIN_FEET:   30,
+
+  flight: {
+    tornadoSpin:      0.6,        // рад/сек (75% повільніше від попереднього 2.5)
+    tornadoPhaseStep: 0.42,       // рад на кожну нову частинку → безперервна спіраль
+    tornadoInnerR:    12,
+    tornadoOuterR:    52,
+    tornadoEmitRate:  8,
+    tornadoLifeMs:    2400,
+    tornadoSize1:     42,
+    tornadoSize2:     16,
+    tornadoAlpha:     0.20,
+    tornadoTint:      0xb8d8f0,
+
+    shockMaxR:        90,
+    shockParticles:   80,
+    shockLifeMs:      990,
+    shockPSize:       15,
+    shockSizeGrow:    2.5,
+    shockAlpha:       0.09,
+
+    flapMs:           340,
+    puffLifeMs:       1400,
+    wingPSize:        65,
+    wingGrow:         4.5,
+    wingAlpha:        0.18,
+    wingOffsetPx:     22,
+    wingBackPx:       10,
+    puffOutSpeed:     1.8,
+    puffDrag:         0.97,
+
+    brakeFlaps:       3,
+    brakeIntervalMs:  130,
+  },
+
+  run: {
+    dustRate:    200,
+    dustLife:    900,
+    dustSize:    30,
+    dustGrow:    1.0,
+    dustAlpha:   0.38,
+
+    pebRate:     80,
+    pebLife:     800,
+    pebCount:    4,
+    pebSize:     6,
+    pebSpeed:    22,
+    pebAlpha:    0.95,
+  },
+
+  burrow: {
+    rate:        80,
+    count:       6,
+    clodSize:    13,
+    speed:       1,
+    restLife:    2500,
+    tokenAlpha:  0.35,
+  },
+
+  moveThreshold: 0.5,
   smoothFactor:  0.2,
-  maxPuffsTotal: 200,
-  maxRingsTotal: 16,
-  zIndex:        200,
-  colorCore:     [220, 235, 255],
-  colorMid:      [180, 210, 240],
-  colorEdge:     [140, 180, 220],
-  alphaMax:      0.9,
+
+  maxParticlesGlobal: 3000,
+  zIndex:             450,
 };
 
-function _mulberry32(seed) {
-  return function() {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+// ── Texture baking via Canvas 2D (bypasses PIXI.Graphics render issues in Foundry v13) ──
+
+function _mkRand(seed) {
+  let s = seed | 0;
+  return () => {
+    s = s + 0x6D2B79F5 | 0;
+    let t = Math.imul(s ^ s >>> 15, 1 | s);
     t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
 
-function _pixiRender(renderer, gfx, rt) {
-  try        { renderer.render({ container: gfx, target: rt }); }
-  catch (_)  {
-    try      { renderer.render(gfx, rt); }
-    catch(_2){ renderer.render({ container: gfx, renderTexture: rt }); }
-  }
-}
+// PIXI v8 uses .circle()/.fill(); v7 uses .drawCircle()/.beginFill()
+const _PIXI8 = !!PIXI.Graphics?.prototype?.circle;
 
-function _bakeBlobTexture(renderer, size = 64) {
-  const c = size / 2;
-  const g = new PIXI.Graphics();
-  const [r0,g0,b0] = _FLY_CFG.colorCore, [r1,g1,b1] = _FLY_CFG.colorMid, [r2,g2,b2] = _FLY_CFG.colorEdge;
-  for (let i = 12; i >= 1; i--) {
-    const t = i / 12;
-    let cr, cg, cb, ca;
-    if (t < 0.4) {
-      const k = t / 0.4;
-      cr = _lerp(r0,r1,k); cg = _lerp(g0,g1,k); cb = _lerp(b0,b1,k); ca = _lerp(0.55,0.35,k);
-    } else {
-      const k = (t-0.4)/0.6;
-      cr = _lerp(r1,r2,k); cg = _lerp(g1,g2,k); cb = _lerp(b1,b2,k); ca = _lerp(0.35,0,k);
+function _gCirc(g, x, y, r, col, a) {
+  if (_PIXI8) { g.circle(x, y, r);              g.fill({ color: col, alpha: a }); }
+  else        { g.beginFill(col, a); g.drawCircle(x, y, r); g.endFill(); }
+}
+function _gEll(g, x, y, rx, ry, col, a) {
+  if (_PIXI8) { g.ellipse(x, y, rx, ry);           g.fill({ color: col, alpha: a }); }
+  else        { g.beginFill(col, a); g.drawEllipse(x, y, rx, ry); g.endFill(); }
+}
+function _gQuadPoly(g, pts, fillCol, fillA, strokeCol, strokeW) {
+  if (_PIXI8) {
+    g.moveTo(pts[0].x, pts[0].y);
+    for (let i = 0; i < pts.length; i++) {
+      const p0 = pts[i], p1 = pts[(i + 1) % pts.length];
+      g.quadraticCurveTo(p0.x, p0.y, (p0.x + p1.x) / 2, (p0.y + p1.y) / 2);
     }
-    g.beginFill((Math.round(cr)<<16)|(Math.round(cg)<<8)|Math.round(cb), ca);
-    g.drawCircle(c, c, c * t);
+    g.closePath();
+    g.fill({ color: fillCol, alpha: fillA });
+    if (strokeW > 0) g.stroke({ color: strokeCol, width: strokeW, alpha: 1 });
+  } else {
+    if (strokeW > 0) g.lineStyle(strokeW, strokeCol, 1);
+    g.beginFill(fillCol, fillA);
+    g.moveTo(pts[0].x, pts[0].y);
+    for (let i = 0; i < pts.length; i++) {
+      const p0 = pts[i], p1 = pts[(i + 1) % pts.length];
+      g.quadraticCurveTo(p0.x, p0.y, (p0.x + p1.x) / 2, (p0.y + p1.y) / 2);
+    }
+    g.closePath();
     g.endFill();
+    if (strokeW > 0) g.lineStyle(0);
   }
-  const rt = PIXI.RenderTexture.create({ width: size, height: size });
-  _pixiRender(renderer, g, rt);
-  g.destroy();
-  return rt;
 }
 
-function _bakePuffTexture(renderer, seed, size = 128) {
-  const rand = _mulberry32(seed);
+function _softBlob(g, bx, by, br, peakAlpha, col, layers) {
+  const a = 1 - Math.pow(1 - Math.min(peakAlpha, 0.999), 1 / layers);
+  for (let j = layers; j >= 1; j--) {
+    _gCirc(g, bx, by, br * j / layers, col, a);
+  }
+}
+
+function _hexRGB(hex) {
+  return [(hex >> 16) & 0xff, (hex >> 8) & 0xff, hex & 0xff];
+}
+
+function _c2dSoftBlob(ctx, bx, by, br, peakAlpha, r, g, b, layers) {
+  const a = 1 - Math.pow(1 - Math.min(peakAlpha, 0.999), 1 / layers);
+  const as = a.toFixed(4);
+  for (let j = layers; j >= 1; j--) {
+    ctx.beginPath();
+    ctx.arc(bx, by, br * j / layers, 0, TAU);
+    ctx.fillStyle = `rgba(${r},${g},${b},${as})`;
+    ctx.fill();
+  }
+}
+
+function _c2dQuadPoly(ctx, pts, fillCSS, strokeCSS, lineW) {
+  ctx.beginPath();
+  const mx = (pts[pts.length-1].x + pts[0].x) / 2;
+  const my = (pts[pts.length-1].y + pts[0].y) / 2;
+  ctx.moveTo(mx, my);
+  for (let i = 0; i < pts.length; i++) {
+    const p0 = pts[i], p1 = pts[(i+1) % pts.length];
+    ctx.quadraticCurveTo(p0.x, p0.y, (p0.x+p1.x)/2, (p0.y+p1.y)/2);
+  }
+  ctx.closePath();
+  ctx.fillStyle = fillCSS;
+  ctx.fill();
+  if (lineW > 0) { ctx.lineWidth = lineW; ctx.strokeStyle = strokeCSS; ctx.stroke(); }
+}
+
+function bakeBlobTexture(size = 64) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  _c2dSoftBlob(ctx, size / 2, size / 2, size / 2, 0.90, 255, 255, 255, 20);
+  return PIXI.Texture.from(cv);
+}
+
+function bakePuffTexture(seed, size = 128) {
+  const rand = _mkRand(seed);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
   const c = size / 2, R = size * 0.38;
   const N = 10 + Math.floor(rand() * 5);
-  const g = new PIXI.Graphics();
-  const [r0,g0,b0] = _FLY_CFG.colorCore, [r1,g1,b1] = _FLY_CFG.colorMid, [r2,g2,b2] = _FLY_CFG.colorEdge;
   for (let i = 0; i < N; i++) {
-    const a = rand()*_TAU, d = rand()*R*0.7;
-    const bx = c+Math.cos(a)*d, by = c+Math.sin(a)*d*0.75;
-    const br = R*(0.35+rand()*0.3), ba = 0.4+rand()*0.4;
-    for (let j = 8; j >= 1; j--) {
-      const t = j/8;
-      let cr, cg, cb, ca;
-      if (t < 0.4) {
-        const k=t/0.4; cr=_lerp(r0,r1,k); cg=_lerp(g0,g1,k); cb=_lerp(b0,b1,k); ca=_lerp(0.55,0.30,k)*ba;
-      } else {
-        const k=(t-0.4)/0.6; cr=_lerp(r1,r2,k); cg=_lerp(g1,g2,k); cb=_lerp(b1,b2,k); ca=_lerp(0.30,0,k)*ba;
-      }
-      g.beginFill((Math.round(cr)<<16)|(Math.round(cg)<<8)|Math.round(cb), ca);
-      g.drawCircle(bx, by, br*t);
-      g.endFill();
-    }
+    const ang = rand() * TAU, d = rand() * R * 0.7;
+    const bx = c + Math.cos(ang) * d, by = c + Math.sin(ang) * d * 0.85;
+    const br = R * (0.35 + rand() * 0.3), ba = (0.4 + rand() * 0.4) * 0.5;
+    _c2dSoftBlob(ctx, bx, by, br, ba, 255, 255, 255, 20);
   }
-  const rt = PIXI.RenderTexture.create({ width: size, height: size });
-  _pixiRender(renderer, g, rt);
-  g.destroy();
-  return rt;
+  return PIXI.Texture.from(cv);
 }
 
-class _Ring {
-  constructor() { this.particles=[]; this.cx=0; this.cy=0; this.age=0; this.life=0; this.maxR=0; this.squashY=0; this.tilt=0; }
-
-  reset(cx, cy, blobTex, container) {
-    this.cx=cx; this.cy=cy; this.age=0;
-    this.life    = _FLY_CFG.ringLifeMs * (0.85 + Math.random()*0.3);
-    this.maxR    = _FLY_CFG.ringMaxR   * (0.9  + Math.random()*0.2);
-    this.squashY = _FLY_CFG.ringSquashY + (Math.random()-0.5)*0.15;
-    this.tilt    = (Math.random()-0.5)*0.3;
-    this.particles.length = 0;
-    const N = _FLY_CFG.ringParticles;
-    for (let i = 0; i < N; i++) {
-      const a = (i/N)*_TAU + (Math.random()-0.5)*0.15;
-      if (Math.random() < 0.3) continue;
-      const spr = new PIXI.Sprite(blobTex);
-      spr.anchor.set(0.5);
-      container.addChild(spr);
-      this.particles.push({ baseAngle:a, radOff:(Math.random()-0.5)*0.25, driftMul:0.85+Math.random()*0.3, size:0.75+Math.random()*0.6, alphaMul:0.5+Math.random()*0.5, spr });
-    }
+function bakeDustTexture(seed, size = 96) {
+  const rand = _mkRand(seed);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  const c = size / 2, R = size * 0.40;
+  const PALETTE = [0xB89060, 0xA07848, 0xC8A870, 0x9A6E3C, 0xD0B880, 0xAA8850, 0xBE9E68];
+  const N = 8 + Math.floor(rand() * 4);
+  for (let i = 0; i < N; i++) {
+    const ang = rand() * TAU, d = rand() * R * 0.7;
+    const bx = c + Math.cos(ang) * d, by = c + Math.sin(ang) * d;
+    const br = R * (0.35 + rand() * 0.3), ba = (0.35 + rand() * 0.35) * 0.7;
+    const [r,g,b] = _hexRGB(PALETTE[Math.floor(rand() * PALETTE.length)]);
+    _c2dSoftBlob(ctx, bx, by, br, ba, r, g, b, 20);
   }
-
-  update(dt) {
-    this.age += dt;
-    if (this.age >= this.life) { this.destroy(); return false; }
-    const t = this.age / this.life;
-    const R = this.maxR * (1 - Math.pow(1-t, 2.2));
-    const env = Math.min(t/0.12, 1) * (1 - Math.pow(t, 1.5));
-    const baseA = env * _FLY_CFG.alphaMax;
-    const grow  = 1 + t * 1.5;
-    for (const p of this.particles) {
-      const finalR = R*(1+p.radOff*p.driftMul) + t*8*p.driftMul;
-      p.spr.x = this.cx + Math.cos(p.baseAngle+this.tilt) * finalR;
-      p.spr.y = this.cy + Math.sin(p.baseAngle+this.tilt) * finalR * this.squashY;
-      const sz = 14 * p.size * grow;
-      p.spr.width = p.spr.height = sz;
-      p.spr.alpha = baseA * p.alphaMul;
-    }
-    return true;
-  }
-
-  destroy() {
-    for (const p of this.particles) { p.spr.parent?.removeChild(p.spr); p.spr.destroy(); }
-    this.particles.length = 0;
-  }
+  return PIXI.Texture.from(cv);
 }
 
-const _fly = {
-  _container:  null,
-  _blobTex:    null,
-  _puffTexs:   [],
-  _tokenState: new Map(),
-  _puffs:      [],
-  _puffPool:   [],
-  _rings:      [],
-  _tickFn:     null,
+function bakePebbleTexture(seed, size = 16) {
+  const rand = _mkRand(seed);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  const c = size / 2, nPts = 6, baseR = c * 0.55;
+  const pts = [];
+  for (let i = 0; i < nPts; i++) {
+    const a = (i / nPts) * TAU, r = baseR * (0.7 + rand() * 0.5);
+    pts.push({ x: c + Math.cos(a) * r, y: c + Math.sin(a) * r });
+  }
+  const variant = Math.floor(rand() * 3);
+  const fills   = ['#7a5a3c', '#6e6258', '#5a4838'];
+  const strokes = ['#3a2818', '#2e2820', '#2a1f10'];
 
-  init() {
-    if (this._container) return;
-    const renderer = canvas.app.renderer;
-    this._blobTex = _bakeBlobTexture(renderer, 64);
-    for (let i = 0; i < 6; i++) this._puffTexs.push(_bakePuffTexture(renderer, 7+i*13, 128));
-    this._container = new PIXI.Container();
-    this._container.zIndex = _FLY_CFG.zIndex;
-    const parent = canvas.primary ?? canvas.stage;
-    parent.addChild(this._container);
-    if (parent.sortableChildren !== undefined) parent.sortableChildren = true;
-    this._tickFn = (ticker) => this._tick(ticker);
-    canvas.app.ticker.add(this._tickFn);
-  },
+  ctx.beginPath();
+  ctx.ellipse(c + 0.8, c + 1.2, c * 0.55, c * 0.40, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fill();
 
-  destroy() {
-    if (this._tickFn) { canvas.app.ticker.remove(this._tickFn); this._tickFn = null; }
-    for (const r of this._rings) r.destroy();
-    this._rings.length = 0;
-    for (const spr of this._puffs) { spr.parent?.removeChild(spr); spr.destroy(); }
-    for (const spr of this._puffPool) spr.destroy();
-    this._puffs.length = 0; this._puffPool.length = 0;
-    this._tokenState.clear();
-    this._container?.destroy({ children: true }); this._container = null;
-    this._blobTex?.destroy(true); this._blobTex = null;
-    for (const t of this._puffTexs) t.destroy(true);
-    this._puffTexs.length = 0;
-  },
+  _c2dQuadPoly(ctx, pts, fills[variant], strokes[variant], 0.8);
 
-  _borrowPuff() {
-    let spr = this._puffPool.pop();
-    const tex = this._puffTexs[Math.floor(Math.random()*this._puffTexs.length)];
-    if (!spr) { spr = new PIXI.Sprite(tex); spr.anchor.set(0.5); }
-    else spr.texture = tex;
-    spr.visible = true;
-    this._container.addChild(spr);
-    return spr;
-  },
+  ctx.beginPath();
+  ctx.ellipse(c - 1.5, c - 1.5, c * 0.2, c * 0.13, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fill();
 
-  _releasePuff(spr) {
-    spr.visible = false;
-    spr.parent?.removeChild(spr);
-    if (this._puffPool.length < 100) this._puffPool.push(spr);
-    else spr.destroy();
-  },
+  return PIXI.Texture.from(cv);
+}
 
-  _emitWingPair(x, y, dx, dy) {
-    if (this._puffs.length + 2 > _FLY_CFG.maxPuffsTotal) return;
-    const len = Math.hypot(dx,dy)||1, fx=dx/len, fy=dy/len, px=-fy, py=fx;
-    for (const side of [-1,1]) {
-      const sx = x - fx*_FLY_CFG.wingBackPx + px*_FLY_CFG.wingOffsetPx*side;
-      const sy = y - fy*_FLY_CFG.wingBackPx + py*_FLY_CFG.wingOffsetPx*side;
-      const outSpd = _FLY_CFG.puffOutSpeed + Math.random()*0.3;
-      const spr = this._borrowPuff();
-      spr.x = sx+(Math.random()-0.5)*3; spr.y = sy+(Math.random()-0.5)*3;
-      spr.rotation = (Math.random()-0.5)*0.4; spr.alpha = 0;
-      spr.__data = { vx:px*side*outSpd+(Math.random()-0.5)*0.1, vy:py*side*outSpd+0.15+Math.random()*0.1,
-        age:0, life:_FLY_CFG.puffLifeMs*(0.9+Math.random()*0.3),
-        maxR:_FLY_CFG.puffSize*(0.55+Math.random()*0.35), rotV:(Math.random()-0.5)*0.001 };
-      this._puffs.push(spr);
-    }
-  },
+function bakeClodTexture(seed, size = 24) {
+  const rand = _mkRand(seed);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  const c = size / 2, nPts = 7 + Math.floor(rand() * 3), baseR = c * 0.65;
+  const pts = [];
+  for (let i = 0; i < nPts; i++) {
+    const a = (i / nPts) * TAU, r = baseR * (0.65 + rand() * 0.5);
+    pts.push({ x: c + Math.cos(a) * r, y: c + Math.sin(a) * r });
+  }
+  const variant = Math.floor(rand() * 4);
+  let fillCSS, strokeCSS, hiRGB;
+  if (variant === 0)      { fillCSS = '#5a3a1a'; strokeCSS = '#2a180a'; hiRGB = [138,90,48]; }
+  else if (variant === 1) { fillCSS = '#6e4825'; strokeCSS = '#2e1c0a'; hiRGB = [154,106,58]; }
+  else if (variant === 2) { fillCSS = '#4a3018'; strokeCSS = '#1a0e05'; hiRGB = [122,79,40]; }
+  else                    { fillCSS = '#785030'; strokeCSS = '#3a2010'; hiRGB = [168,122,74]; }
 
-  _spawnRing(x, y) {
-    if (this._rings.length >= _FLY_CFG.maxRingsTotal) return;
-    const r = new _Ring();
-    r.reset(x, y, this._blobTex, this._container);
-    this._rings.push(r);
-  },
+  ctx.beginPath();
+  ctx.ellipse(c + 1.2, c + 1.6, c * 0.65, c * 0.45, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fill();
 
-  _tick(ticker) {
-    if (!this._container) return;
-    const dt  = ticker?.deltaMS ?? (canvas.app.ticker.deltaMS ?? 16);
-    const now = performance.now();
-    const tokens = canvas.tokens?.placeables ?? [];
-    const liveIds = new Set();
+  _c2dQuadPoly(ctx, pts, fillCSS, strokeCSS, 1.2);
 
-    for (const token of tokens) {
-      const mesh = token.mesh;
-      if (!mesh) continue;
-      const id = token.id;
-      liveIds.add(id);
-      const mx = mesh.x, my = mesh.y;
-      let st = this._tokenState.get(id);
-      if (!st) {
-        this._tokenState.set(id, { prevX:mx, prevY:my, smoothSpeed:0, flapPhase:0, wasPeak:false, lastRingTs:0 });
-        continue;
-      }
-      const ddx = mx-st.prevX, ddy = my-st.prevY;
-      st.smoothSpeed = _lerp(st.smoothSpeed, Math.hypot(ddx,ddy), _FLY_CFG.smoothFactor);
-      st.prevX=mx; st.prevY=my;
-      if ((token.document?.elevation??0) <= 0) continue;
-      if (st.smoothSpeed > _FLY_CFG.moveThreshold) {
-        st.flapPhase += dt / _FLY_CFG.flapMs;
-        const peak = Math.sin(st.flapPhase*_TAU) > 0.85;
-        if (peak && !st.wasPeak) this._emitWingPair(mx, my, ddx, ddy);
-        st.wasPeak = peak;
-      } else {
-        st.wasPeak = false;
-        if (now - st.lastRingTs > _FLY_CFG.ringRateMs) { this._spawnRing(mx,my); st.lastRingTs=now; }
-      }
-    }
+  ctx.beginPath();
+  ctx.ellipse(c - baseR*0.25, c - baseR*0.3, baseR*0.35, baseR*0.22, 0, 0, TAU);
+  ctx.fillStyle = `rgba(${hiRGB[0]},${hiRGB[1]},${hiRGB[2]},0.45)`;
+  ctx.fill();
 
-    if (this._tokenState.size > liveIds.size)
-      for (const id of [...this._tokenState.keys()]) if (!liveIds.has(id)) this._tokenState.delete(id);
+  for (let i = 0; i < 3; i++) {
+    const a = rand() * TAU, d = rand() * baseR * 0.5;
+    ctx.beginPath();
+    ctx.arc(c + Math.cos(a)*d, c + Math.sin(a)*d, 0.8 + rand() * 0.8, 0, TAU);
+    ctx.fillStyle = strokeCSS;
+    ctx.globalAlpha = 0.4;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
 
-    for (let i = this._rings.length-1; i >= 0; i--)
-      if (!this._rings[i].update(dt)) this._rings.splice(i,1);
+  return PIXI.Texture.from(cv);
+}
 
-    const drag = Math.pow(_FLY_CFG.puffDrag, dt/16);
-    for (let i = this._puffs.length-1; i >= 0; i--) {
-      const spr = this._puffs[i], d = spr.__data;
-      d.age += dt;
-      if (d.age >= d.life) { this._puffs.splice(i,1); this._releasePuff(spr); continue; }
-      const t = d.age/d.life;
-      const size  = _lerp(d.maxR*0.5, d.maxR*2.0, _easeOut(Math.min(t*1.6,1)));
-      const alpha = t < 0.12 ? _lerp(0,1,t/0.12) : _lerp(1,0,(t-0.12)/0.88);
-      spr.x += d.vx*(dt/16); spr.y += d.vy*(dt/16);
-      d.vx *= drag; d.vy *= drag;
-      spr.rotation += d.rotV*dt;
-      spr.width=size*1.15; spr.height=size*0.9;
-      spr.alpha = alpha * _FLY_CFG.alphaMax;
-    }
-  },
+function _mkSprite(tex) {
+  return new PIXI.Sprite(tex);
+}
+
+const Scale = {
+  shockwave:  s => Math.pow(s, 0.8),
+  tornado:    s => 0.7 + (s - 1) * 0.5,
+  puff:       s => 0.85 + (s - 1) * 0.35,
+  wingOffset: s => 1 + (s - 1) * 0.7,
 };
 
-async function animWalk(token, wpts, totalMs, bsx, bsy) {
+class ParticlePool {
+  constructor(container, defaultTexture, capacity = 500) {
+    this.container = container;
+    this.defaultTexture = defaultTexture;
+    this.capacity = capacity;
+    this.idle = [];
+    this.active = [];
+  }
+
+  borrow(texture) {
+    let spr = this.idle.pop();
+    if (!spr) {
+      spr = _mkSprite(texture || this.defaultTexture);
+      spr.anchor.set(0.5);
+      this.container.addChild(spr);
+    } else {
+      if (texture) spr.texture = texture;
+      spr.visible = true;
+    }
+    return spr;
+  }
+
+  release(spr) {
+    spr.visible = false;
+    if (this.idle.length < this.capacity) this.idle.push(spr);
+    else { spr.parent?.removeChild(spr); spr.destroy(); }
+  }
+
+  destroy() {
+    for (const { spr } of this.active) spr.destroy();
+    for (const spr of this.idle) spr.destroy();
+    this.active.length = 0;
+    this.idle.length = 0;
+  }
+}
+
+class FlightSystem {
+  constructor(container, blobTex, puffTexs) {
+    this.container = container;
+    this.blobTex = blobTex;
+    this.puffTexs = puffTexs;
+    this.tornadoParticles = [];
+    this.shockParticles   = [];
+    this.shockwaves       = [];
+    this.puffs            = [];
+    this.brakeQueue       = [];
+  }
+
+  emitTornado(tokenId, cx, cy, streamPhase, scale) {
+    const spr = _mkSprite(this.blobTex);
+    spr.anchor.set(0.5);
+    spr.alpha     = 0;
+    spr.tint      = CFG.flight.tornadoTint;
+    this.container.addChild(spr);
+
+    this.tornadoParticles.push({
+      tokenId, spr,
+      cx, cy,
+      angle: streamPhase + (Math.random() - 0.5) * 0.3,
+      age: 0,
+      life: CFG.flight.tornadoLifeMs * (0.85 + Math.random() * 0.3),
+      sizeMul: (0.7 + Math.random() * 0.5) * scale,
+      alphaMul: 0.6 + Math.random() * 0.4,
+      scale,
+    });
+  }
+
+  clearTornadoFor(tokenId) {
+    for (let i = this.tornadoParticles.length - 1; i >= 0; i--) {
+      if (this.tornadoParticles[i].tokenId === tokenId) {
+        const p = this.tornadoParticles[i];
+        p.spr.parent?.removeChild(p.spr);
+        p.spr.destroy();
+        this.tornadoParticles.splice(i, 1);
+      }
+    }
+  }
+
+  spawnShockwave(cx, cy, scale, tokenR = 0) {
+    const N = Math.round(CFG.flight.shockParticles * Math.min(scale, 2.5));
+    const particles = [];
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * TAU + (Math.random() - 0.5) * 0.15;
+      if (Math.random() < 0.2) continue;
+      const spr = _mkSprite(this.blobTex);
+      spr.anchor.set(0.5);
+      spr.tint      = 0xc8e0f8;
+      this.container.addChild(spr);
+      particles.push({
+        spr,
+        baseAngle: a,
+        radOff:   (Math.random() - 0.5) * 0.25,
+        driftMul: 0.85 + Math.random() * 0.3,
+        size:     0.85 + Math.random() * 0.7,
+        alphaMul: 0.6 + Math.random() * 0.4,
+      });
+    }
+    this.shockwaves.push({
+      cx, cy,
+      age: 0,
+      life: CFG.flight.shockLifeMs * Math.pow(scale, 0.3),
+      minR: tokenR,
+      maxR: CFG.flight.shockMaxR * scale,
+      scale,
+      particles,
+    });
+  }
+
+  emitWingPair(x, y, dx, dy, sizeScale) {
+    const len = Math.hypot(dx, dy) || 1;
+    const fx = dx / len, fy = dy / len;
+    const perpX = -fy, perpY = fx;
+    const offsetMul = Scale.wingOffset(sizeScale);
+    const puffMul = Scale.puff(sizeScale);
+
+    for (const side of [-1, 1]) {
+      const sx = x - fx * CFG.flight.wingBackPx * offsetMul + perpX * CFG.flight.wingOffsetPx * offsetMul * side;
+      const sy = y - fy * CFG.flight.wingBackPx * offsetMul + perpY * CFG.flight.wingOffsetPx * offsetMul * side;
+      const outSpeed = CFG.flight.puffOutSpeed + Math.random() * 0.6;
+      const vx = perpX * side * outSpeed - fx * 1.2 + (Math.random() - 0.5) * 0.3;
+      const vy = perpY * side * outSpeed - fy * 1.2 + (Math.random() - 0.5) * 0.3;
+
+      const tex = this.puffTexs[Math.floor(Math.random() * this.puffTexs.length)];
+      const spr = _mkSprite(tex);
+      spr.anchor.set(0.5);
+      spr.tint  = 0xb8cce0;
+      spr.x = sx + (Math.random() - 0.5) * 3;
+      spr.y = sy + (Math.random() - 0.5) * 3;
+      spr.rotation = (Math.random() - 0.5) * 0.4;
+      spr.alpha = 0;
+      this.container.addChild(spr);
+
+      this.puffs.push({
+        spr, vx, vy,
+        age: 0,
+        life: CFG.flight.puffLifeMs * (0.9 + Math.random() * 0.3),
+        maxR: CFG.flight.wingPSize * (0.55 + Math.random() * 0.35) * puffMul,
+        rotV: (Math.random() - 0.5) * 0.001,
+      });
+    }
+  }
+
+  triggerBrake(x, y, dx, dy, sizeScale) {
+    for (let i = 0; i < CFG.flight.brakeFlaps; i++) {
+      this.brakeQueue.push({
+        triggerAt: performance.now() + i * CFG.flight.brakeIntervalMs,
+        x, y,
+        dx: -dx, dy: -dy,
+        sizeScale,
+      });
+    }
+  }
+
+  update(dtMs, nowMs) {
+    const spin = CFG.flight.tornadoSpin * 0.001;
+    for (let i = this.tornadoParticles.length - 1; i >= 0; i--) {
+      const p = this.tornadoParticles[i];
+      p.age += dtMs;
+      if (p.age >= p.life) {
+        p.spr.parent?.removeChild(p.spr);
+        p.spr.destroy();
+        this.tornadoParticles.splice(i, 1);
+        continue;
+      }
+      p.angle += spin * dtMs;
+      const t = p.age / p.life;
+      const r = lerp(CFG.flight.tornadoInnerR * p.scale, CFG.flight.tornadoOuterR * p.scale, easeOut(t));
+      p.spr.x = p.cx + Math.cos(p.angle) * r;
+      p.spr.y = p.cy + Math.sin(p.angle) * r;
+      const size = lerp(CFG.flight.tornadoSize1, CFG.flight.tornadoSize2, t) * p.sizeMul;
+      p.spr.width = p.spr.height = size;
+      const fadeIn  = Math.min(t / 0.15, 1);
+      const fadeOut = 1 - Math.pow(t, 1.8);
+      p.spr.alpha = fadeIn * fadeOut * p.alphaMul * CFG.flight.tornadoAlpha;
+    }
+
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const sw = this.shockwaves[i];
+      sw.age += dtMs;
+      if (sw.age >= sw.life) {
+        for (const p of sw.particles) { p.spr.parent?.removeChild(p.spr); p.spr.destroy(); }
+        this.shockwaves.splice(i, 1);
+        continue;
+      }
+      const t = sw.age / sw.life;
+      const R = lerp(sw.minR, sw.maxR, 1 - Math.pow(1 - t, 2.2));
+      const fadeIn  = Math.min(t / 0.10, 1);
+      const fadeOut = 1 - Math.pow(t, 1.4);
+      const baseAlpha = fadeIn * fadeOut * CFG.flight.shockAlpha;
+      const sizeGrow = 1 + t * CFG.flight.shockSizeGrow;
+      for (const p of sw.particles) {
+        const r = R * (1 + p.radOff * p.driftMul) + t * 12 * p.driftMul;
+        p.spr.x = sw.cx + Math.cos(p.baseAngle) * r;
+        p.spr.y = sw.cy + Math.sin(p.baseAngle) * r;
+        const drawSize = CFG.flight.shockPSize * p.size * sizeGrow * Math.sqrt(sw.scale);
+        p.spr.width = p.spr.height = drawSize;
+        p.spr.alpha = baseAlpha * p.alphaMul;
+      }
+    }
+
+    for (let i = this.brakeQueue.length - 1; i >= 0; i--) {
+      const b = this.brakeQueue[i];
+      if (nowMs >= b.triggerAt) {
+        this.emitWingPair(b.x, b.y, b.dx, b.dy, b.sizeScale);
+        this.brakeQueue.splice(i, 1);
+      }
+    }
+
+    const drag = Math.pow(CFG.flight.puffDrag, dtMs / 16);
+    for (let i = this.puffs.length - 1; i >= 0; i--) {
+      const p = this.puffs[i];
+      p.age += dtMs;
+      if (p.age >= p.life) {
+        p.spr.parent?.removeChild(p.spr);
+        p.spr.destroy();
+        this.puffs.splice(i, 1);
+        continue;
+      }
+      const t = p.age / p.life;
+      const size = lerp(p.maxR * 0.5, p.maxR * CFG.flight.wingGrow, easeOut(Math.min(t * 1.6, 1)));
+      const alpha = t < 0.12 ? lerp(0, 1, t / 0.12) : lerp(1, 0, (t - 0.12) / 0.88);
+      p.spr.x += p.vx * (dtMs / 16);
+      p.spr.y += p.vy * (dtMs / 16);
+      p.vx *= drag;
+      p.vy *= drag;
+      p.spr.rotation += p.rotV * dtMs;
+      p.spr.width  = size * 1.15;
+      p.spr.height = size * 0.9;
+      p.spr.alpha  = alpha * CFG.flight.wingAlpha;
+    }
+  }
+
+  destroy() {
+    for (const p of this.tornadoParticles) p.spr.destroy();
+    for (const sw of this.shockwaves) for (const p of sw.particles) p.spr.destroy();
+    for (const p of this.puffs) p.spr.destroy();
+    this.tornadoParticles.length = 0;
+    this.shockwaves.length = 0;
+    this.puffs.length = 0;
+    this.brakeQueue.length = 0;
+  }
+}
+
+class RunSystem {
+  constructor(container, dustTexs, pebbleTexs) {
+    this.container = container;
+    this.dustTexs = dustTexs;
+    this.pebbleTexs = pebbleTexs;
+    this.dust = [];
+    this.pebbles = [];
+  }
+
+  emitDust(x, y, dx, dy, halfR = 30) {
+    const len = Math.hypot(dx, dy) || 1;
+    const fx = dx / len, fy = dy / len;
+    const perpX = -fy, perpY = fx;
+    const tex = this.dustTexs[Math.floor(Math.random() * this.dustTexs.length)];
+    const spr = _mkSprite(tex);
+    spr.anchor.set(0.5);
+    this.container.addChild(spr);
+    const backOff  = halfR + 4 + Math.random() * 10;
+    const sideOff  = (Math.random() - 0.5) * halfR * 0.9;
+    spr.x = x - fx * backOff + perpX * sideOff;
+    spr.y = y - fy * backOff + perpY * sideOff;
+    spr.rotation = Math.random() * TAU;
+
+    const backSpd = 1.8 + Math.random() * 1.4;
+    const sideSpd = (Math.random() - 0.5) * 2.2;
+    this.dust.push({
+      spr,
+      vx: -fx * backSpd + perpX * sideSpd,
+      vy: -fy * backSpd + perpY * sideSpd,
+      age: 0,
+      life: CFG.run.dustLife * (0.85 + Math.random() * 0.3),
+      maxR: CFG.run.dustSize * (0.7 + Math.random() * 0.6),
+      rotV: (Math.random() - 0.5) * 0.003,
+      alphaMul: 0.7 + Math.random() * 0.3,
+    });
+  }
+
+  emitPebbles(x, y, dx, dy, halfR = 30) {
+    const len = Math.hypot(dx, dy) || 1;
+    const fx = dx / len, fy = dy / len;
+    const perpX = -fy, perpY = fx;
+    for (let i = 0; i < CFG.run.pebCount; i++) {
+      const back = 0.7 + Math.random() * 0.6;
+      const sideAmt = (Math.random() - 0.5) * 1.0;
+      const speed = CFG.run.pebSpeed * 0.12 * (0.8 + Math.random() * 0.5);
+      const vx = (-fx * back + perpX * sideAmt) * speed;
+      const vy = (-fy * back + perpY * sideAmt) * speed;
+      const tex = this.pebbleTexs[Math.floor(Math.random() * this.pebbleTexs.length)];
+      const spr = _mkSprite(tex);
+      spr.anchor.set(0.5);
+      const sideOff = (Math.random() - 0.5) * halfR * 0.7;
+      spr.x = x - fx * (halfR + 2 + Math.random() * 6) + perpX * sideOff;
+      spr.y = y - fy * (halfR + 2 + Math.random() * 6) + perpY * sideOff;
+      spr.rotation = Math.random() * TAU;
+      const sc = 0.7 + Math.random() * 0.7;
+      spr.scale.set(CFG.run.pebSize * 2 * sc / 16);
+      this.container.addChild(spr);
+
+      this.pebbles.push({
+        spr, vx, vy,
+        age: 0,
+        life: CFG.run.pebLife * (0.85 + Math.random() * 0.3),
+        rotV: (Math.random() - 0.5) * 0.02,
+      });
+    }
+  }
+
+  update(dtMs) {
+    for (let i = this.dust.length - 1; i >= 0; i--) {
+      const p = this.dust[i];
+      p.age += dtMs;
+      if (p.age >= p.life) { p.spr.parent?.removeChild(p.spr); p.spr.destroy(); this.dust.splice(i, 1); continue; }
+      p.spr.x += p.vx * (dtMs / 16);
+      p.spr.y += p.vy * (dtMs / 16);
+      p.vx *= Math.pow(0.96, dtMs / 16);
+      p.vy *= Math.pow(0.96, dtMs / 16);
+      p.spr.rotation += p.rotV * dtMs;
+      const t = p.age / p.life;
+      const size = lerp(p.maxR * 0.4, p.maxR * CFG.run.dustGrow, easeOut(Math.min(t * 1.4, 1)));
+      const fadeIn = Math.min(t / 0.10, 1);
+      const fadeOut = 1 - Math.pow(t, 1.5);
+      p.spr.width = p.spr.height = size;
+      p.spr.alpha = fadeIn * fadeOut * p.alphaMul * CFG.run.dustAlpha;
+    }
+
+    for (let i = this.pebbles.length - 1; i >= 0; i--) {
+      const p = this.pebbles[i];
+      p.age += dtMs;
+      if (p.age >= p.life) { p.spr.parent?.removeChild(p.spr); p.spr.destroy(); this.pebbles.splice(i, 1); continue; }
+      p.spr.x += p.vx * (dtMs / 16);
+      p.spr.y += p.vy * (dtMs / 16);
+      const drag = Math.pow(0.88, dtMs / 16);
+      p.vx *= drag;
+      p.vy *= drag;
+      p.spr.rotation += p.rotV * dtMs;
+      const t = p.age / p.life;
+      p.spr.alpha = (t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4) * CFG.run.pebAlpha;
+    }
+  }
+
+  destroy() {
+    for (const p of this.dust) p.spr.destroy();
+    for (const p of this.pebbles) p.spr.destroy();
+    this.dust.length = 0;
+    this.pebbles.length = 0;
+  }
+}
+
+class BurrowSystem {
+  constructor(container, clodTexs) {
+    this.container = container;
+    this.clodTexs = clodTexs;
+    this.clods = [];
+  }
+
+  emit(x, y, dx, dy, gridSize) {
+    const len = Math.hypot(dx, dy) || 1;
+    const fx = dx / len, fy = dy / len;
+    const halfPx = (gridSize * (canvas.dimensions?.size ?? 64)) / 2;
+
+    for (let i = 0; i < CFG.burrow.count; i++) {
+      const sx = x + (Math.random() - 0.5) * halfPx * 2;
+      const sy = y + (Math.random() - 0.5) * halfPx * 2;
+      const a = Math.random() * TAU;
+      const speed = CFG.burrow.speed * 0.06 * (0.5 + Math.random() * 0.5);
+      const vx = Math.cos(a) * speed - fx * speed * 0.2;
+      const vy = Math.sin(a) * speed - fy * speed * 0.2;
+      const sizeMul = (0.7 + Math.random() * 0.6) * 0.85;
+      const tex = this.clodTexs[Math.floor(Math.random() * this.clodTexs.length)];
+      const spr = _mkSprite(tex);
+      spr.anchor.set(0.5);
+      spr.x = sx; spr.y = sy;
+      spr.rotation = Math.random() * TAU;
+      spr.scale.set(CFG.burrow.clodSize * 2 * sizeMul / 24);
+      this.container.addChild(spr);
+
+      this.clods.push({
+        spr, vx, vy,
+        state: 'flying',
+        age: 0,
+        bounceCount: 1 + Math.floor(Math.random() * 2),
+        rotV: (Math.random() - 0.5) * 0.012,
+        sizeMul,
+        restingAge: 0,
+        restLife: CFG.burrow.restLife * (0.7 + Math.random() * 0.5),
+      });
+    }
+  }
+
+  update(dtMs) {
+    for (let i = this.clods.length - 1; i >= 0; i--) {
+      const c = this.clods[i];
+      if (c.state === 'flying') {
+        c.age += dtMs;
+        c.spr.x += c.vx * (dtMs / 16);
+        c.spr.y += c.vy * (dtMs / 16);
+        const drag = Math.pow(0.93, dtMs / 16);
+        c.vx *= drag;
+        c.vy *= drag;
+        c.spr.rotation += c.rotV * dtMs;
+        const sp = Math.hypot(c.vx, c.vy);
+        if (sp < 0.1 && c.age > 80) {
+          if (c.bounceCount > 0) {
+            const a = Math.random() * TAU;
+            const bs = 0.4 + Math.random() * 0.3;
+            c.vx = Math.cos(a) * bs;
+            c.vy = Math.sin(a) * bs;
+            c.rotV *= 0.6;
+            c.bounceCount--;
+          } else {
+            c.state = 'resting';
+            c.vx = 0; c.vy = 0; c.rotV = 0;
+          }
+        }
+      } else {
+        c.restingAge += dtMs;
+        if (c.restingAge >= c.restLife) {
+          c.spr.parent?.removeChild(c.spr);
+          c.spr.destroy();
+          this.clods.splice(i, 1);
+          continue;
+        }
+        const t = c.restingAge / c.restLife;
+        c.spr.alpha = (t < 0.7 ? 0.55 : 0.55 * (1 - (t - 0.7) / 0.3));
+      }
+    }
+  }
+
+  destroy() {
+    for (const c of this.clods) c.spr.destroy();
+    this.clods.length = 0;
+  }
+}
+
+class TokenEffectState {
+  constructor(token) {
+    this.token = token;
+    this.id = token.id;
+    this.prevX = 0; this.prevY = 0;
+    this.smoothSpeed = 0;
+    this.flapPhase = 0;
+    this.wasPeak = false;
+    this.lastRingTs = 0;
+    this.tornadoCenterActive = false;
+    this.tornadoCenterX = 0; this.tornadoCenterY = 0;
+    this.tornadoAccum = 0;
+    this.tornadoPhase = 0;
+    this.wasFlying = false;
+    this.wasMoving = false;
+    this.wasGroundMoving = false;
+    this.wasBurrowing = false;
+    this.lastMoveDx = 0; this.lastMoveDy = 0;
+    this.distanceMovedFt = 0;
+    this.lastElevationFt = 0;
+    this.peakElevationFt = 0;
+    this.lastDustTs = 0;
+    this.lastPebTs  = 0;
+    this.lastBurrowTs = 0;
+  }
+}
+
+class TokenEffects {
+  static _instance = null;
+  static get instance() {
+    if (!this._instance) this._instance = new TokenEffects();
+    return this._instance;
+  }
+
+  constructor() {
+    this.containers = null;
+    this.systems = null;
+    this.states = new Map();
+    this._tickBound = null;
+  }
+
+  init() {
+    if (this.containers) return;
+    try {
+      const flightContainer = new PIXI.Container();
+      const runContainer    = new PIXI.Container();
+      const burrowContainer = new PIXI.Container();
+      for (const c of [flightContainer, runContainer, burrowContainer]) {
+        c.eventMode           = 'none';
+        c.interactive         = false;
+        c.interactiveChildren = false;
+      }
+      flightContainer.zIndex = CFG.zIndex + 2;
+      runContainer.zIndex    = CFG.zIndex + 1;
+      burrowContainer.zIndex = CFG.zIndex;
+
+      // Darken particles to match scene darkness without reducing alpha
+      // (alpha-based dimming makes already-faint particles invisible).
+      const CMF = PIXI.filters?.ColorMatrixFilter ?? PIXI.ColorMatrixFilter;
+      this._darkFilters = CMF ? [new CMF(), new CMF(), new CMF()] : null;
+      if (this._darkFilters) {
+        flightContainer.filters = [this._darkFilters[0]];
+        runContainer.filters    = [this._darkFilters[1]];
+        burrowContainer.filters = [this._darkFilters[2]];
+      }
+
+      const effectParent = canvas.stage;
+      effectParent.addChild(burrowContainer, runContainer, flightContainer);
+
+      console.log('[smooth-move] baking textures…');
+      const blobTex    = bakeBlobTexture(64);
+      const puffTexs   = [7, 20, 33, 46, 59, 72].map(s => bakePuffTexture(s, 128));
+      const dustTexs   = [3, 17, 31, 47, 59, 73].map(s => bakeDustTexture(s, 96));
+      const pebbleTexs = [11, 23, 37, 53, 67, 83, 97, 109].map(s => bakePebbleTexture(s, 16));
+      const clodTexs   = [3, 17, 31, 47, 59, 73, 89, 101, 113, 127].map(s => bakeClodTexture(s, 24));
+      console.log('[smooth-move] textures baked, blob valid:', blobTex?.width > 0);
+
+      this.containers = { flight: flightContainer, run: runContainer, burrow: burrowContainer };
+      this.textures = { blob: blobTex, puffs: puffTexs, dust: dustTexs, pebbles: pebbleTexs, clods: clodTexs };
+      this.systems = {
+        flight: new FlightSystem(flightContainer, blobTex, puffTexs),
+        run:    new RunSystem(runContainer, dustTexs, pebbleTexs),
+        burrow: new BurrowSystem(burrowContainer, clodTexs),
+      };
+
+      this._tickBound = this._onTick.bind(this);
+      canvas.app.ticker.add(this._tickBound);
+      window._smTE = this;
+      console.log('[smooth-move] init() complete — ticker running');
+    } catch (err) {
+      console.error('[smooth-move] init() FAILED:', err);
+    }
+  }
+
+  destroy() {
+    if (!this.containers) return;
+    canvas.app.ticker.remove(this._tickBound);
+    this.systems.flight.destroy();
+    this.systems.run.destroy();
+    this.systems.burrow.destroy();
+    for (const c of Object.values(this.containers)) c.destroy({ children: true });
+    for (const t of [this.textures.blob, ...this.textures.puffs, ...this.textures.dust, ...this.textures.pebbles, ...this.textures.clods]) {
+      t.destroy(true);
+    }
+    for (const f of this._darkFilters ?? []) try { f.destroy(); } catch (_) {}
+    this._darkFilters = null;
+    this.containers = null;
+    this.systems = null;
+    this.states.clear();
+  }
+
+  _dropToken(id) {
+    this.systems?.flight?.clearTornadoFor(id);
+    this.states.delete(id);
+  }
+
+  _onTick(ticker) {
+    if (!this.systems) return;
+    if (!this._ticked) { this._ticked = true; console.log('[smooth-move] ticker firing, tokens:', canvas.tokens?.placeables?.length); }
+    this._diagTick = (this._diagTick ?? 0) + 1;
+    if (this._diagTick % 180 === 0) {
+      const p0 = this.systems.flight.tornadoParticles[0];
+      console.log('[smooth-move] diag — tornadoCount:', this.systems.flight.tornadoParticles.length,
+        'p0.alpha:', p0?.spr?.alpha?.toFixed(3), 'p0.x:', p0?.spr?.x?.toFixed(0),
+        'flightParent:', this.containers?.flight?.parent?.constructor?.name,
+        'flightVisible:', this.containers?.flight?.visible,
+        'parentVisible:', this.containers?.flight?.parent?.visible);
+    }
+    const dt = ticker.deltaMS ?? 16;
+    const now = performance.now();
+
+    if (this._darkFilters) {
+      const darkness   = canvas.scene?.darkness ?? 0;
+      const brightness = Math.max(0.1, 1 - darkness);
+      for (const f of this._darkFilters) {
+        if (typeof f.brightness === 'function') f.brightness(brightness, false);
+        else { f.matrix = [brightness,0,0,0,0, 0,brightness,0,0,0, 0,0,brightness,0,0, 0,0,0,1,0]; }
+      }
+    }
+
+    const ftPerPx = (canvas.scene?.grid?.distance ?? 5) / (canvas.dimensions?.size ?? 64);
+
+    const tokens = canvas.tokens?.placeables ?? [];
+    for (const token of tokens) {
+      this._updateToken(token, dt, now, ftPerPx);
+    }
+
+    this.systems.flight.update(dt, now);
+    this.systems.run.update(dt);
+    this.systems.burrow.update(dt);
+  }
+
+  _updateToken(token, dt, now, ftPerPx) {
+    const mesh = token.mesh;
+    if (!mesh) return;
+    const mx = mesh.x;
+    const my = mesh.y;
+
+    const elevationFt = token.document?.elevation ?? 0;
+    const gridSize    = Math.max(token.document?.width ?? 1, token.document?.height ?? 1);
+    const gridPx      = canvas.dimensions?.size ?? 100;
+    const tScale      = (gridSize * gridPx) / 100;   // 1.0 = 100px reference token
+    const isBurrowing = getMoveMode(token) === 'burrow';
+
+    let st = this.states.get(token.id);
+    if (!st) {
+      st = new TokenEffectState(token);
+      st.prevX = mx; st.prevY = my;
+      st.lastElevationFt = elevationFt;
+      this.states.set(token.id, st);
+      return;
+    }
+
+    const ddx = mx - st.prevX;
+    const ddy = my - st.prevY;
+    const inst = Math.hypot(ddx, ddy);
+    st.smoothSpeed = lerp(st.smoothSpeed, inst, CFG.smoothFactor);
+    st.prevX = mx; st.prevY = my;
+    if (inst > 0.5) { st.lastMoveDx = ddx; st.lastMoveDy = ddy; }
+
+    const isMoving = st.smoothSpeed > CFG.moveThreshold;
+    const isFlying = elevationFt > 0;
+
+    if (isMoving) st.distanceMovedFt += inst * ftPerPx;
+    if (isFlying && elevationFt > st.peakElevationFt) st.peakElevationFt = elevationFt;
+
+    if (isFlying) {
+      if (!isMoving) {
+        if (!st.tornadoCenterActive) {
+          st.tornadoCenterX = mx;
+          st.tornadoCenterY = my;
+          st.tornadoCenterActive = true;
+        }
+        st.tornadoAccum += dt / 1000 * CFG.flight.tornadoEmitRate;
+        while (st.tornadoAccum >= 1) {
+          this.systems.flight.emitTornado(token.id, st.tornadoCenterX, st.tornadoCenterY, st.tornadoPhase, tScale);
+          st.tornadoPhase += CFG.flight.tornadoPhaseStep;
+          st.tornadoAccum -= 1;
+        }
+      } else {
+        if (st.tornadoCenterActive) {
+          this.systems.flight.clearTornadoFor(token.id);
+          st.tornadoCenterActive = false;
+        }
+        st.flapPhase += dt / CFG.flight.flapMs;
+        const peak = Math.sin(st.flapPhase * TAU) > 0.85;
+        if (peak && !st.wasPeak) {
+          this.systems.flight.emitWingPair(mx, my, ddx, ddy, tScale);
+        }
+        st.wasPeak = peak;
+      }
+
+      if (st.wasMoving && !isMoving) {
+        if (st.distanceMovedFt >= CFG.BRAKE_MIN_FEET) {
+          this.systems.flight.triggerBrake(mx, my, st.lastMoveDx, st.lastMoveDy, tScale);
+        }
+        st.distanceMovedFt = 0;
+      }
+    } else {
+      st.tornadoCenterActive = false;
+      st.wasPeak = false;
+    }
+
+    if (st.wasFlying && !isFlying) {
+      if (st.peakElevationFt >= CFG.LAND_MIN_FEET) {
+        this.systems.flight.spawnShockwave(mx, my, tScale, gridSize * gridPx / 2);
+      }
+      this.systems.flight.clearTornadoFor(token.id);
+      st.tornadoCenterActive = false;
+      st.peakElevationFt = 0;
+    }
+    if (!st.wasFlying && isFlying) {
+      st.peakElevationFt = elevationFt;
+    }
+
+    if (!isFlying && isMoving && !isBurrowing && (token._smRunFt ?? 0) > CFG.RUN_MIN_FEET) {
+      if (now - st.lastPebTs > CFG.run.pebRate) {
+        this.systems.run.emitPebbles(mx, my, st.lastMoveDx, st.lastMoveDy, gridSize * gridPx / 2);
+        st.lastPebTs = now;
+      }
+    }
+
+    if (isBurrowing && isMoving) {
+      if (now - st.lastBurrowTs > CFG.burrow.rate) {
+        this.systems.burrow.emit(mx, my, ddx, ddy, tScale);
+        st.lastBurrowTs = now;
+      }
+      if (token.mesh) token.mesh.alpha = CFG.burrow.tokenAlpha;
+    } else {
+      if (st.wasBurrowing && token.mesh) token.mesh.alpha = 1.0;
+    }
+
+    st.wasMoving = isMoving;
+    st.wasFlying = isFlying;
+    st.wasGroundMoving = isMoving && !isFlying;
+    st.wasBurrowing = isBurrowing;
+  }
+}
+
+async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
   const steps  = wpts.length - 1;
   const stepMs = totalMs / Math.max(steps, 1);
-  const tr     = Math.min(token.w ?? 50, token.h ?? 50) / 2;
   let svx = 0, rot = 0;
 
-  const layer = makeParticleLayer();
   for (let i = 0; i < steps; i++) {
     const fx = wpts[i].x,   fy = wpts[i].y;
     const dx = wpts[i+1].x - fx, dy = wpts[i+1].y - fy;
-    const len = Math.hypot(dx, dy) || 1;
-    spawnWalkDust(layer, fx, fy, dx/len, dy/len, tr);
 
     await new Promise(res => {
       const t0  = performance.now();
@@ -930,7 +1479,7 @@ async function animWalk(token, wpts, totalMs, bsx, bsy) {
         if (token.mesh) {
           token.mesh.position.set(fx + dx * ek, fy + dy * ek);
           token.mesh.scale.set(bsx * E, bsy * E);
-          token.mesh.rotation = rot;
+          token.mesh.rotation = baseRot + rot;
           syncPos(token);
         }
         if (k >= 1) {
@@ -943,7 +1492,6 @@ async function animWalk(token, wpts, totalMs, bsx, bsy) {
       canvas.app.ticker.add(tick);
     });
   }
-  setTimeout(() => layer.destroy(), 1200);
 }
 
 function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
@@ -981,7 +1529,6 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
       }
 
       if (layer) {
-        // Takeoff burst on first frame
         if (!burstDone && prof.burstEffect) {
           burstDone = true;
           prof.burstEffect(layer, pos.x, pos.y, tr);
@@ -989,10 +1536,8 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
         spawnTimer += dt;
         if (spawnTimer >= spawnInterval) {
           spawnTimer -= spawnInterval;
-          const underground = prof.effect === spawnDirtChunk && t > 0.2 && t < 0.8;
-          prof.effect(layer, pos.x, pos.y, dirX, dirY, tr, underground);
+          prof.effect(layer, pos.x, pos.y, dirX, dirY, tr);
         }
-        // Landing burst near end
         if (t > 0.88 && !layer._landingDone && prof.burstEffect) {
           layer._landingDone = true;
           prof.burstEffect(layer, pos.x, pos.y, tr);
@@ -1097,18 +1642,19 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
     canvas.app.ticker.add(tick);
   });
 
+  if(token.mesh){token.mesh.alpha=0;} gfx.clear(); trail.clear();
+
   await new Promise(res => {
     const t0=performance.now();
     const tick=()=>{
-      const k=clamp((performance.now()-t0)/inMs,0,1), eK=1-(1-k)*(1-k);
-      gfx.clear(); drawParts(dest.x,dest.y,(1-eK)*gs*0.65,eK);
-      gfx.lineStyle(2.5,CORE,(1-k)*0.7); gfx.drawCircle(dest.x,dest.y,eK*gs*0.55); gfx.lineStyle(0);
-      drawTrail(1-k);
-      if(token.mesh){token.mesh.alpha=eK;const S=1+(1-eK)*0.55;token.mesh.scale.set(bsx*S,bsy*S);syncPos(token);}
+      const k=clamp((performance.now()-t0)/inMs,0,1), eK=eio4(k);
+      gfx.clear(); drawParts(dest.x,dest.y,eK*gs*0.65*(1-k),k);
+      gfx.lineStyle(2.5,CORE,k*0.85); gfx.drawCircle(dest.x,dest.y,eK*gs*0.45); gfx.lineStyle(0);
+      if(token.mesh){token.mesh.alpha=k;token.mesh.scale.set(bsx*(0.88+k*0.12),bsy*(0.88+k*0.12));syncPos(token);}
       if(k>=1){canvas.app.ticker.remove(tick);res();}
     };
     canvas.app.ticker.add(tick);
   });
 
-  try { fx.destroy({ children: true }); } catch (_) {}
+  try { fx.destroy({ children: true }); } catch(_) {}
 }
