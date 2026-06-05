@@ -40,10 +40,26 @@ Hooks.once("setup", () => {
     }
 
     _onUpdate(data, options, userId) {
-      // Case 1: finishing our own local drag — document is updated, sync visuals
+      // Case 1: our own commit (or Foundry's auto-commits for remaining planned waypoints).
+      // _smFinalPx holds the position we already animated to.
+      // For intermediate auto-commits (different position) we skip position processing
+      // so document.x/y stays at our final value when _smCommitting expires.
       if (this._smCommitting) {
+        const final = this._smFinalPx;
+        const hasPos = data.x != null || data.y != null;
+        if (final && hasPos) {
+          const tw = this.w ?? 0, th = this.h ?? 0;
+          const isFinal = Math.abs(data.x - (final.x - tw/2)) < 2
+                       && Math.abs(data.y - (final.y - th/2)) < 2;
+          if (!isFinal) {
+            // Intermediate auto-commit — process non-position fields only
+            const { x: _x, y: _y, ...rest } = data;
+            if (Object.keys(rest).length) super._onUpdate(rest, options, userId);
+            return;
+          }
+        }
         super._onUpdate(data, options, userId);
-        delete this._smCommitting;
+        if (final && this.mesh) this.mesh.position.set(final.x, final.y);
         canvas.tokens?.recalculatePlannedMovementPaths?.();
         syncPosAndPerception(this);
         return;
@@ -136,9 +152,10 @@ Hooks.once("setup", () => {
         const tStart = t._smStartPx ?? { x: t.mesh.position.x, y: t.mesh.position.y };
         delete t._smStartPx;
         const tWPs = updateOptions?.movement?.[tid]?.waypoints;
-        if (!tWPs?.length) continue;
         const tw = t.w ?? 0, th = t.h ?? 0;
-        const meshWPs = tWPs.map(wp => ({ x: wp.x + tw/2, y: wp.y + th/2 }));
+        const meshWPs = tWPs?.length
+          ? tWPs.map(wp => ({ x: wp.x + tw/2, y: wp.y + th/2 }))
+          : [{ x: (upd.x ?? t.document.x) + tw/2, y: (upd.y ?? t.document.y) + th/2 }];
         const first   = meshWPs[0];
         const skip    = Math.abs(first.x - tStart.x) < 2 && Math.abs(first.y - tStart.y) < 2;
         const raw     = skip ? [tStart, ...meshWPs.slice(1)] : [tStart, ...meshWPs];
@@ -159,26 +176,30 @@ Hooks.once("setup", () => {
 
         await Promise.all(jobs.map(j => animate(j.token, j.pts, j.mode)));
 
-        // Build commit movement for all tokens
-        const commitMovement = {};
+        // Override x/y with our final animation position; keep original movement so
+        // Foundry's planned-movement auto-commits are absorbed by _smCommitting in Case 1.
+        const finalUpdates = capturedUpdates.map(upd => {
+          const tid = upd._id ?? upd.id;
+          const job = jobs.find(j => j.token.id === tid);
+          if (!job) return upd;
+          const last = job.pts[job.pts.length - 1];
+          const tw = job.token.w ?? 0, th = job.token.h ?? 0;
+          return { ...upd, x: last.x - tw/2, y: last.y - th/2 };
+        });
         for (const j of jobs) {
-          const origMov = capturedOptions?.movement?.[j.token.id] ?? {};
-          commitMovement[j.token.id] = { ...origMov, waypoints: [origMov.waypoints?.at(-1) ?? j.upd] };
+          const last = j.pts[j.pts.length - 1];
+          j.token._smFinalPx = { x: last.x, y: last.y };
           j.token._smCommitting = true;
-          setTimeout(() => { delete j.token._smCommitting; }, 500);
+          setTimeout(() => { delete j.token._smCommitting; delete j.token._smFinalPx; }, 800);
         }
 
-        await canvas.scene?.updateEmbeddedDocuments("Token", capturedUpdates,
-          { animate: false, panCamera: false, movement: commitMovement });
+        await canvas.scene?.updateEmbeddedDocuments("Token", finalUpdates,
+          { animate: false, panCamera: false, movement: capturedOptions?.movement });
 
         for (const j of jobs) {
-          const t = j.token;
-          if (t.mesh) {
-            const docX = t.document?.x ?? j.upd.x;
-            const docY = t.document?.y ?? j.upd.y;
-            if (docX != null) t.mesh.position.set(docX + (t.w ?? 0)/2, docY + (t.h ?? 0)/2);
-          }
-          delete t.x; delete t.y;
+          const last = j.pts[j.pts.length - 1];
+          if (j.token.mesh) j.token.mesh.position.set(last.x, last.y);
+          syncPos(j.token);
         }
       })().catch(err => console.error("[smooth-move] animation error:", err))
         .finally(() => { this.layer._smGroupDrop = false; });
