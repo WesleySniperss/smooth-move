@@ -47,21 +47,24 @@ Hooks.once("setup", () => {
         return;
       }
 
-      // Case 2: position update sent by another client with animate:false
-      // (smooth-move always sends animate:false, so other clients need to animate themselves)
+      // Case 2: position update from another client (animate:false = smooth-move commit)
+      // Socket message should have already started animation; this is a fallback.
       const hasPos = data.x != null || data.y != null;
       if (hasPos && !this._smActive && options?.animate === false) {
         const startX = this.mesh?.position.x;
         const startY = this.mesh?.position.y;
 
-        super._onUpdate(data, options, userId); // updates document, snaps mesh to new pos
+        super._onUpdate(data, options, userId);
+
+        const remotePts = this._smRemotePts;
+        const remoteMode = this._smRemoteMode;
+        delete this._smRemotePts;
+        delete this._smRemoteMode;
 
         const w = this.w ?? 0, h = this.h ?? 0;
-        const wps = options?.movement?.[this.id]?.waypoints;
         let pts;
-        if (wps?.length >= 2) {
-          pts = wps.map(wp => ({ x: wp.x + w/2, y: wp.y + h/2 }));
-          if (startX != null) pts[0] = { x: startX, y: startY };
+        if (remotePts?.length >= 2) {
+          pts = [{ x: startX, y: startY }, ...remotePts.slice(1)];
         } else {
           const endX = (data.x ?? this.document.x) + w/2;
           const endY = (data.y ?? this.document.y) + h/2;
@@ -70,7 +73,7 @@ Hooks.once("setup", () => {
         }
         if (pts.length >= 2) {
           if (this.mesh) this.mesh.position.set(pts[0].x, pts[0].y);
-          animate(this, pts, getMoveMode(this)).catch(() => {});
+          animate(this, pts, remoteMode ?? getMoveMode(this)).catch(() => {});
         }
         return;
       }
@@ -153,6 +156,18 @@ Hooks.once("setup", () => {
 
       (async () => {
         this.layer?.clearPreviewContainer?.();
+
+        // Broadcast path to all other clients so they animate simultaneously
+        for (const j of jobs) {
+          game.socket.emit(`module.${MODULE_ID}`, {
+            type: "smMove",
+            sceneId: canvas.scene?.id,
+            tokenId: j.token.id,
+            pts: j.pts,
+            mode: j.mode,
+          });
+        }
+
         for (const j of jobs) if (j.token.mesh) j.token.mesh.position.set(j.pts[0].x, j.pts[0].y);
 
         await Promise.all(jobs.map(j => animate(j.token, j.pts, j.mode)));
@@ -191,7 +206,30 @@ Hooks.once("ready", () => {
       delete token._smStartPx;
     }
   }, { capture: true });
-  Hooks.on("canvasReady",    () => { for (const t of canvas.tokens?.placeables ?? []) delete t._smStartPx; TokenEffects.instance.destroy(); TokenEffects.instance.init(); });
+
+  game.socket.on(`module.${MODULE_ID}`, msg => {
+    if (msg.type !== "smMove") return;
+    if (msg.sceneId !== canvas.scene?.id) return;
+    const token = canvas.tokens?.get(msg.tokenId);
+    if (!token?.mesh) return;
+    if (token._smActive) {
+      token._smRemotePts  = msg.pts;
+      token._smRemoteMode = msg.mode;
+      return;
+    }
+    token.mesh.position.set(msg.pts[0].x, msg.pts[0].y);
+    animate(token, msg.pts, msg.mode).catch(() => {});
+  });
+
+  Hooks.on("canvasReady", () => {
+    for (const t of canvas.tokens?.placeables ?? []) {
+      delete t._smStartPx;
+      delete t._smRemotePts;
+      delete t._smRemoteMode;
+    }
+    TokenEffects.instance.destroy();
+    TokenEffects.instance.init();
+  });
   Hooks.on("canvasTearDown", () => TokenEffects.instance.destroy());
   Hooks.on("deleteToken",    (doc) => TokenEffects.instance._dropToken(doc.id));
   if (canvas?.ready) TokenEffects.instance.init();
