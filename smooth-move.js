@@ -45,21 +45,8 @@ Hooks.once("setup", () => {
       // For intermediate auto-commits (different position) we skip position processing
       // so document.x/y stays at our final value when _smCommitting expires.
       if (this._smCommitting) {
-        const final = this._smFinalPx;
-        const hasPos = data.x != null || data.y != null;
-        if (final && hasPos) {
-          const tw = this.w ?? 0, th = this.h ?? 0;
-          const isFinal = Math.abs(data.x - (final.x - tw/2)) < 2
-                       && Math.abs(data.y - (final.y - th/2)) < 2;
-          if (!isFinal) {
-            // Intermediate auto-commit — process non-position fields only
-            const { x: _x, y: _y, ...rest } = data;
-            if (Object.keys(rest).length) super._onUpdate(rest, options, userId);
-            return;
-          }
-        }
         super._onUpdate(data, options, userId);
-        if (final && this.mesh) this.mesh.position.set(final.x, final.y);
+        if (this._smFinalPx && this.mesh) this.mesh.position.set(this._smFinalPx.x, this._smFinalPx.y);
         canvas.tokens?.recalculatePlannedMovementPaths?.();
         syncPosAndPerception(this);
         return;
@@ -194,7 +181,7 @@ Hooks.once("setup", () => {
         }
 
         await canvas.scene?.updateEmbeddedDocuments("Token", finalUpdates,
-          { animate: false, panCamera: false, movement: capturedOptions?.movement });
+          { animate: false, panCamera: false });
 
         for (const j of jobs) {
           const last = j.pts[j.pts.length - 1];
