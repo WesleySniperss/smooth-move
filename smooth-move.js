@@ -1329,16 +1329,6 @@ class TokenEffects {
 
   _onTick(ticker) {
     if (!this.systems) return;
-    if (!this._ticked) { this._ticked = true; console.log('[smooth-move] ticker firing, tokens:', canvas.tokens?.placeables?.length); }
-    this._diagTick = (this._diagTick ?? 0) + 1;
-    if (this._diagTick % 180 === 0) {
-      const p0 = this.systems.flight.tornadoParticles[0];
-      console.log('[smooth-move] diag — tornadoCount:', this.systems.flight.tornadoParticles.length,
-        'p0.alpha:', p0?.spr?.alpha?.toFixed(3), 'p0.x:', p0?.spr?.x?.toFixed(0),
-        'flightParent:', this.containers?.flight?.parent?.constructor?.name,
-        'flightVisible:', this.containers?.flight?.visible,
-        'parentVisible:', this.containers?.flight?.parent?.visible);
-    }
     const dt = ticker.deltaMS ?? 16;
     const now = performance.now();
 
@@ -1582,7 +1572,6 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
       }
       if (t >= 1) {
         canvas.app.ticker.remove(tick);
-        syncPosAndPerception(token);
         if (layer) setTimeout(() => layer.destroy(), 1500);
         res();
       }
