@@ -42,7 +42,6 @@ Hooks.once("setup", () => {
     _onUpdate(data, options, userId) {
       if (this._smCommitting) {
         super._onUpdate(data, options, userId);
-        if (this._smFinalPx && this.mesh) this.mesh.position.set(this._smFinalPx.x, this._smFinalPx.y);
         canvas.tokens?.recalculatePlannedMovementPaths?.();
         syncPosAndPerception(this);
         return;
@@ -166,21 +165,21 @@ Hooks.once("setup", () => {
           const tw = job.token.w ?? 0, th = job.token.h ?? 0;
           return { ...upd, x: last.x - tw/2, y: last.y - th/2 };
         });
+        const commitMovement = {};
         for (const j of jobs) {
+          const origMov = updateOptions?.movement?.[j.token.id] ?? {};
           const last = j.pts[j.pts.length - 1];
-          j.token._smFinalPx = { x: last.x, y: last.y };
+          const tw = j.token.w ?? 0, th = j.token.h ?? 0;
+          const finalWp = origMov.waypoints?.at(-1) ?? { x: last.x - tw/2, y: last.y - th/2 };
+          commitMovement[j.token.id] = { ...origMov, waypoints: [finalWp] };
           j.token._smCommitting = true;
-          setTimeout(() => { delete j.token._smCommitting; delete j.token._smFinalPx; }, 800);
+          setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
         await canvas.scene?.updateEmbeddedDocuments("Token", finalUpdates,
-          { animate: false, panCamera: false });
+          { animate: false, panCamera: false, movement: commitMovement });
 
-        for (const j of jobs) {
-          const last = j.pts[j.pts.length - 1];
-          if (j.token.mesh) j.token.mesh.position.set(last.x, last.y);
-          syncPos(j.token);
-        }
+        for (const j of jobs) syncPosAndPerception(j.token);
       })().catch(err => console.error("[smooth-move] animation error:", err))
         .finally(() => { this.layer._smGroupDrop = false; });
     }
