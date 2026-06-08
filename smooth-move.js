@@ -1507,10 +1507,10 @@ async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
           token.mesh.scale.set(bsx * E, bsy * E);
           token.mesh.rotation = baseRot + rot;
           syncPos(token);
+          token.initializeSources?.();
         }
         if (k >= 1) {
           canvas.app.ticker.remove(tick);
-          syncPosAndPerception(token);
           playStepSound(i);
           res();
         }
@@ -1578,6 +1578,7 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
         if (prof.scale) { const S = prof.scale(t); token.mesh.scale.set(bsx*S, bsy*S); }
         if (prof.alpha !== undefined) token.mesh.alpha = prof.alpha(t);
         syncPos(token);
+        token.initializeSources?.();
       }
       if (t >= 1) {
         canvas.app.ticker.remove(tick);
@@ -1606,6 +1607,7 @@ async function animStep(token, wpts, totalMs, prof) {
             from.y + (to.y - from.y) * prof.ease(t),
           );
           syncPos(token);
+          token.initializeSources?.();
         }
         if (t >= 1) { canvas.app.ticker.remove(tick); res(); }
       };
