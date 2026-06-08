@@ -40,10 +40,6 @@ Hooks.once("setup", () => {
     }
 
     _onUpdate(data, options, userId) {
-      // Case 1: our own commit (or Foundry's auto-commits for remaining planned waypoints).
-      // _smFinalPx holds the position we already animated to.
-      // For intermediate auto-commits (different position) we skip position processing
-      // so document.x/y stays at our final value when _smCommitting expires.
       if (this._smCommitting) {
         super._onUpdate(data, options, userId);
         if (this._smFinalPx && this.mesh) this.mesh.position.set(this._smFinalPx.x, this._smFinalPx.y);
@@ -154,7 +150,6 @@ Hooks.once("setup", () => {
       if (!jobs.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
 
       const capturedUpdates = tokenUpdates;
-      const capturedOptions = updateOptions;
       this.layer._smGroupDrop = true;
 
       (async () => {
@@ -163,8 +158,6 @@ Hooks.once("setup", () => {
 
         await Promise.all(jobs.map(j => animate(j.token, j.pts, j.mode)));
 
-        // Override x/y with our final animation position; keep original movement so
-        // Foundry's planned-movement auto-commits are absorbed by _smCommitting in Case 1.
         const finalUpdates = capturedUpdates.map(upd => {
           const tid = upd._id ?? upd.id;
           const job = jobs.find(j => j.token.id === tid);
