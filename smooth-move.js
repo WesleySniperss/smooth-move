@@ -1510,7 +1510,7 @@ async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
         }
         if (k >= 1) {
           canvas.app.ticker.remove(tick);
-          syncPosAndPerception(token);
+          syncPos(token);
           playStepSound(i);
           res();
         }
