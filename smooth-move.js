@@ -151,6 +151,7 @@ Hooks.once("setup", () => {
         for (const j of jobs) {
           game.socket.emit(`module.${MODULE_ID}`, {
             type: "smMove",
+            userId: game.user?.id,
             sceneId: canvas.scene?.id,
             tokenId: j.token.id,
             pts: j.pts,
@@ -175,8 +176,27 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
+        // Build movement option per token: single displace waypoint bypasses wall
+        // constraints and size changes; pan:false uses the correct Foundry v13 option name.
+        const movement = {};
+        for (const j of jobs) {
+          const last = j.pts[j.pts.length - 1];
+          const tw = j.token.w ?? 0, th = j.token.h ?? 0;
+          movement[j.token.id] = {
+            waypoints: [{ x: last.x - tw/2, y: last.y - th/2,
+              elevation: j.token.document.elevation ?? 0,
+              width: j.token.document.width ?? 1,
+              height: j.token.document.height ?? 1,
+              shape: j.token.document.shape,
+              action: "displace", snapped: false, explicit: true, checkpoint: true }],
+            method: "api",
+            constrainOptions: { ignoreWalls: true, ignoreCost: true },
+            autoRotate: false,
+            showRuler: false,
+          };
+        }
         await canvas.scene?.updateEmbeddedDocuments("Token", finalUpdates,
-          { animate: false, panCamera: false });
+          { animate: false, pan: false, movement });
 
         for (const j of jobs) syncPosAndPerception(j.token);
       })().catch(err => console.error("[smooth-move] animation error:", err))
@@ -199,6 +219,7 @@ Hooks.once("ready", () => {
 
   game.socket.on(`module.${MODULE_ID}`, msg => {
     if (msg.type !== "smMove") return;
+    if (msg.userId === game.user?.id) return;   // ignore own messages (Foundry echoes back)
     if (msg.sceneId !== canvas.scene?.id) return;
     if (msg.pts?.length < 2) return;
     const token = canvas.tokens?.get(msg.tokenId);
