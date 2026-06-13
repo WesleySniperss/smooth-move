@@ -224,6 +224,9 @@ Hooks.once("ready", () => {
     if (msg.pts?.length < 2) return;
     const token = canvas.tokens?.get(msg.tokenId);
     if (!token?.mesh || token._smActive) return;
+    // Hidden tokens are never rendered to non-GM clients — skip the pointless
+    // off-screen animation rather than spinning a ticker on an invisible mesh.
+    if (token.document?.hidden && !game.user?.isGM) return;
     token.mesh.position.set(msg.pts[0].x, msg.pts[0].y);
     animate(token, msg.pts, msg.mode).catch(() => {});
   });
@@ -262,6 +265,29 @@ function syncPosAndPerception(token) {
   syncPos(token);
   token.initializeSources?.();
   canvas.perception?.update({ refreshVision: true });
+}
+
+// Recompute whether the mesh should be visible to THIS client at the token's
+// current animated position. Mirrors Foundry's Token#isVisible (foundry.mjs
+// _refreshVisibility, which core runs every frame via refreshVisibility flag).
+// We bypass that pipeline by moving the mesh directly, so without this a token
+// dragged behind a wall / out of sight by the GM would keep showing its motion
+// to players until the final commit. GM and owned/controlled tokens are skipped.
+function updateMeshVisibility(token) {
+  if (game.user?.isGM) return;
+  const mesh = token.mesh;
+  if (!mesh) return;
+  if (token.controlled) return;
+  if (token.document?.hidden) { mesh.visible = false; return; }
+  if (!canvas.visibility?.tokenVision) return;
+  if (token.vision?.active) return;
+  const { width, height } = token.document.getSize();
+  const tol = Math.min(width, height) / 4;
+  const visible = canvas.visibility.testVisibility(
+    { x: mesh.position.x, y: mesh.position.y },
+    { tolerance: tol, object: token },
+  );
+  mesh.visible = visible && token.renderable;
 }
 
 function getMoveMode(token) {
@@ -1519,6 +1545,7 @@ async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
           token.mesh.rotation = baseRot + rot;
           syncPos(token);
           token.initializeSources?.();
+          updateMeshVisibility(token);
         }
         if (k >= 1) {
           canvas.app.ticker.remove(tick);
@@ -1590,6 +1617,7 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
         if (prof.alpha !== undefined) token.mesh.alpha = prof.alpha(t);
         syncPos(token);
         token.initializeSources?.();
+        updateMeshVisibility(token);
       }
       if (t >= 1) {
         canvas.app.ticker.remove(tick);
@@ -1618,6 +1646,7 @@ async function animStep(token, wpts, totalMs, prof) {
           );
           syncPos(token);
           token.initializeSources?.();
+          updateMeshVisibility(token);
         }
         if (t >= 1) { canvas.app.ticker.remove(tick); res(); }
       };
