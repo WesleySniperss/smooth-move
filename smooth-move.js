@@ -290,6 +290,21 @@ function updateMeshVisibility(token) {
   mesh.visible = visible && token.renderable;
 }
 
+// Per-frame upkeep during our custom animation, mirroring what core Foundry
+// does in Token#_onAnimationUpdate (which we bypass by moving the mesh directly).
+// Light/vision sources are only re-initialized when the token actually has sight
+// or emits light AND the user has Vision Animation enabled — exactly Foundry's
+// own guard, so we don't pay the per-frame perception cost for tokens that need
+// neither, nor when the user has opted out for FPS. Mesh visibility is always
+// refreshed (cheap point test) so fog-of-war stays correct mid-animation.
+function refreshDuringAnimation(token) {
+  if (game.settings.get("core", "visionAnimation")
+      && (token.hasSight || token._isLightSource?.())) {
+    token.initializeSources?.();
+  }
+  updateMeshVisibility(token);
+}
+
 function getMoveMode(token) {
   return (
     token.dragActionHandler?.currentAction
@@ -1544,8 +1559,7 @@ async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
           token.mesh.scale.set(bsx * E, bsy * E);
           token.mesh.rotation = baseRot + rot;
           syncPos(token);
-          token.initializeSources?.();
-          updateMeshVisibility(token);
+          refreshDuringAnimation(token);
         }
         if (k >= 1) {
           canvas.app.ticker.remove(tick);
@@ -1616,8 +1630,7 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
         if (prof.scale) { const S = prof.scale(t); token.mesh.scale.set(bsx*S, bsy*S); }
         if (prof.alpha !== undefined) token.mesh.alpha = prof.alpha(t);
         syncPos(token);
-        token.initializeSources?.();
-        updateMeshVisibility(token);
+        refreshDuringAnimation(token);
       }
       if (t >= 1) {
         canvas.app.ticker.remove(tick);
@@ -1645,8 +1658,7 @@ async function animStep(token, wpts, totalMs, prof) {
             from.y + (to.y - from.y) * prof.ease(t),
           );
           syncPos(token);
-          token.initializeSources?.();
-          updateMeshVisibility(token);
+          refreshDuringAnimation(token);
         }
         if (t >= 1) { canvas.app.ticker.remove(tick); res(); }
       };
