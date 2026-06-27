@@ -232,7 +232,18 @@ Hooks.once("ready", () => {
   });
 
   Hooks.on("canvasReady", () => {
-    for (const t of canvas.tokens?.placeables ?? []) delete t._smStartPx;
+    // A reload mid-animation leaves our state flags set and the mesh scaled
+    // (finally never ran). Clear everything and re-derive each token's size
+    // from its document so nothing starts the session inflated or stuck.
+    for (const t of canvas.tokens?.placeables ?? []) {
+      delete t._smStartPx;
+      delete t._smActive;
+      delete t._smCommitting;
+      delete t._smBaseScale;
+      delete t._smRunFt;
+      if (t.mesh) { t.mesh.alpha = 1; }
+      try { t._refreshSize?.(); } catch (_) {}
+    }
     TokenEffects.instance.destroy();
     TokenEffects.instance.init();
   });
@@ -529,13 +540,16 @@ async function animate(token, waypoints, mode) {
   const dur  = totalMs * prof.mult;
   const gs   = canvas.grid.size ?? 100;
   // Capture the TRUE base scale, never the live mesh scale mid-bounce. The walk
-  // bounce and fly/teleport profiles multiply this base every frame; if a second
-  // animation starts while the first is still bouncing (E up to 1.12) and reads
-  // the inflated live scale as its "base", finally restores the inflated value
-  // and the token grows with every move. Reusing the stored base while an
-  // animation owns the mesh prevents that compounding; a fresh capture only
-  // happens when no animation is active, so legitimate size changes still apply.
+  // bounce and fly/teleport profiles multiply this base every frame, so reading
+  // an already-inflated mesh.scale as the "base" would freeze that inflation in
+  // place (finally restores it, every move re-multiplies). The live mesh.scale
+  // is unreliable: a prior animation may have been interrupted before finally
+  // ran (e.g. the page was reloaded mid-move), leaving it bouncy. So when no
+  // animation owns the mesh, first ask Foundry to reset the mesh size from the
+  // document (the source of truth) — this self-heals any leftover inflation —
+  // then capture. While an animation is already running, reuse its stored base.
   if (!(token._smActive && token._smBaseScale)) {
+    try { token._refreshSize?.(); } catch (_) {}
     token._smBaseScale = { x: token.mesh?.scale?.x ?? 1, y: token.mesh?.scale?.y ?? 1 };
   }
   const bsx  = token._smBaseScale.x;
@@ -555,10 +569,13 @@ async function animate(token, waypoints, mode) {
     else if (prof.kind === "teleport") await animTeleport(token, waypoints, dur, bsx, bsy);
     else                               await animCont(token, waypoints, dur, prof, gs, bsx, bsy);
   } finally {
-    if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
-    delete token._smRunFt;
-    syncPosAndPerception(token);
     delete token._smActive;
+    delete token._smBaseScale;
+    delete token._smRunFt;
+    if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
+    // Re-derive the final size from the document so any drift can't persist.
+    try { token._refreshSize?.(); } catch (_) {}
+    syncPosAndPerception(token);
   }
 }
 
