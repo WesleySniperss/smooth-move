@@ -528,8 +528,18 @@ async function animate(token, waypoints, mode) {
   const prof = PROFILES[mode] ?? PROFILES.walk;
   const dur  = totalMs * prof.mult;
   const gs   = canvas.grid.size ?? 100;
-  const bsx  = token.mesh?.scale?.x ?? 1;
-  const bsy  = token.mesh?.scale?.y ?? 1;
+  // Capture the TRUE base scale, never the live mesh scale mid-bounce. The walk
+  // bounce and fly/teleport profiles multiply this base every frame; if a second
+  // animation starts while the first is still bouncing (E up to 1.12) and reads
+  // the inflated live scale as its "base", finally restores the inflated value
+  // and the token grows with every move. Reusing the stored base while an
+  // animation owns the mesh prevents that compounding; a fresh capture only
+  // happens when no animation is active, so legitimate size changes still apply.
+  if (!(token._smActive && token._smBaseScale)) {
+    token._smBaseScale = { x: token.mesh?.scale?.x ?? 1, y: token.mesh?.scale?.y ?? 1 };
+  }
+  const bsx  = token._smBaseScale.x;
+  const bsy  = token._smBaseScale.y;
   const tr   = Math.min(token.w ?? 50, token.h ?? 50) / 2;
 
   const baseRot = token.mesh?.rotation ?? 0;
