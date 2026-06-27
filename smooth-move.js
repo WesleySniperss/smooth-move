@@ -232,17 +232,18 @@ Hooks.once("ready", () => {
   });
 
   Hooks.on("canvasReady", () => {
-    // A reload mid-animation leaves our state flags set and the mesh scaled
-    // (finally never ran). Clear everything and re-derive each token's size
-    // from its document so nothing starts the session inflated or stuck.
+    // A reload mid-animation leaves our state flags set on the fresh placeables
+    // (finally never ran). Clear them so nothing starts the session stuck. Do
+    // NOT call _refreshSize here: at canvasReady token textures may still be the
+    // placeholder, and resizing against it produces a giant scale. Foundry draws
+    // each token at the correct size itself once its texture finishes loading.
     for (const t of canvas.tokens?.placeables ?? []) {
       delete t._smStartPx;
       delete t._smActive;
       delete t._smCommitting;
       delete t._smBaseScale;
       delete t._smRunFt;
-      if (t.mesh) { t.mesh.alpha = 1; }
-      try { t._refreshSize?.(); } catch (_) {}
+      if (t.mesh) t.mesh.alpha = 1;
     }
     TokenEffects.instance.destroy();
     TokenEffects.instance.init();
@@ -262,6 +263,15 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const animMs = () => game.settings.get(MODULE_ID, "animMs") ?? 900;
 
 function playStepSound(_i) {}
+
+// True only when the token's texture is actually loaded. Foundry's _refreshSize
+// computes mesh scale as baseWidth / texture.width (primary-sprite-mesh resize);
+// if the texture is still the ~1px placeholder (e.g. right after a page reload),
+// that division yields a giant scale. Never call _refreshSize until this passes.
+function meshTextureReady(token) {
+  const tex = token?.mesh?.texture;
+  return !!(token?.mesh && tex && (tex.width ?? 0) > 1 && (tex.height ?? 0) > 1);
+}
 
 function syncPos(token) {
   const mesh = token.mesh;
@@ -549,7 +559,7 @@ async function animate(token, waypoints, mode) {
   // document (the source of truth) — this self-heals any leftover inflation —
   // then capture. While an animation is already running, reuse its stored base.
   if (!(token._smActive && token._smBaseScale)) {
-    try { token._refreshSize?.(); } catch (_) {}
+    if (meshTextureReady(token)) { try { token._refreshSize?.(); } catch (_) {} }
     token._smBaseScale = { x: token.mesh?.scale?.x ?? 1, y: token.mesh?.scale?.y ?? 1 };
   }
   const bsx  = token._smBaseScale.x;
@@ -573,8 +583,9 @@ async function animate(token, waypoints, mode) {
     delete token._smBaseScale;
     delete token._smRunFt;
     if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
-    // Re-derive the final size from the document so any drift can't persist.
-    try { token._refreshSize?.(); } catch (_) {}
+    // Re-derive the final size from the document so any drift can't persist —
+    // but only once the texture is loaded, or resize would compute a giant scale.
+    if (meshTextureReady(token)) { try { token._refreshSize?.(); } catch (_) {} }
     syncPosAndPerception(token);
   }
 }
