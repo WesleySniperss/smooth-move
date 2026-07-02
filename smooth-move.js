@@ -273,6 +273,36 @@ function meshTextureReady(token) {
   return !!(token?.mesh && tex && (tex.width ?? 0) > 1 && (tex.height ?? 0) > 1);
 }
 
+// The scale Foundry itself would give the mesh, derived purely from the document
+// and the loaded texture — an exact replica of Token#_refreshMeshSizeAndScale +
+// PrimarySpriteMesh#resize. Used as a hard backstop: the animation base scale is
+// clamped to this, so no code path can make a token grow past its true size,
+// no matter what left mesh.scale inflated. Returns null until the texture loads.
+function documentScale(token) {
+  const tex = token?.mesh?.texture;
+  if (!tex || (tex.width ?? 0) <= 1 || (tex.height ?? 0) <= 1) return null;
+  const doc = token.document;
+  const size = doc?.getSize?.();
+  if (!size) return null;
+  const texDoc = doc.texture ?? {};
+  let scaleX = texDoc.scaleX ?? 1, scaleY = texDoc.scaleY ?? 1;
+  if (token.hasDynamicRing && CONFIG.Token?.ring?.isGridFitMode) {
+    const adj = token.ring?.subjectScaleAdjustment ?? 1;
+    scaleX *= adj; scaleY *= adj;
+  }
+  const tw = tex.width, th = tex.height;
+  const fit = texDoc.fit ?? "fill";
+  let sx, sy;
+  switch (fit) {
+    case "cover":   sx = sy = Math.max(size.width / tw, size.height / th); break;
+    case "contain": sx = sy = Math.min(size.width / tw, size.height / th); break;
+    case "width":   sx = sy = size.width / tw; break;
+    case "height":  sx = sy = size.height / th; break;
+    default:        sx = size.width / tw; sy = size.height / th; break; // "fill"
+  }
+  return { x: Math.abs(sx * scaleX), y: Math.abs(sy * scaleY) };
+}
+
 function syncPos(token) {
   const mesh = token.mesh;
   if (!mesh) return;
@@ -560,7 +590,19 @@ async function animate(token, waypoints, mode) {
   // then capture. While an animation is already running, reuse its stored base.
   if (!(token._smActive && token._smBaseScale)) {
     if (meshTextureReady(token)) { try { token._refreshSize?.(); } catch (_) {} }
-    token._smBaseScale = { x: token.mesh?.scale?.x ?? 1, y: token.mesh?.scale?.y ?? 1 };
+    let cx = token.mesh?.scale?.x ?? 1;
+    let cy = token.mesh?.scale?.y ?? 1;
+    // Hard backstop: never accept a base scale larger than the document-derived
+    // scale (plus a bounce margin). Even if some unforeseen path left mesh.scale
+    // inflated, the captured base is pinned to the true size — so a token can
+    // physically never grow past ~1.5x its correct size, let alone become giant.
+    const ds = documentScale(token);
+    if (ds) {
+      const LIM = 1.5;
+      if (Math.abs(cx) > ds.x * LIM) cx = Math.sign(cx || 1) * ds.x;
+      if (Math.abs(cy) > ds.y * LIM) cy = Math.sign(cy || 1) * ds.y;
+    }
+    token._smBaseScale = { x: cx, y: cy };
   }
   const bsx  = token._smBaseScale.x;
   const bsy  = token._smBaseScale.y;
