@@ -29,14 +29,17 @@ Hooks.once("setup", () => {
       return super._refreshPosition?.(...args);
     }
 
-    async animateMovement(...args) {
-      if (this._smActive || this._smCommitting) return;
-      return super.animateMovement?.(...args);
-    }
-
-    async _animateMovement(...args) {
-      if (this._smActive || this._smCommitting) return;
-      return super._animateMovement?.(...args);
+    // Foundry v14 removed Token#animateMovement/#_animateMovement. Movement is now
+    // dispatched through the public Token#animate under the movement animation name
+    // (see Token##onUpdateAnimation). Suppress only that animation while our own
+    // ticker owns the mesh — other animations (alpha, bars, texture, ring) must
+    // still run normally, so we key on the name rather than blocking everything.
+    animate(to, options = {}) {
+      if ((this._smActive || this._smCommitting)
+          && options.name === this.movementAnimationName) {
+        return Promise.resolve();
+      }
+      return super.animate(to, options);
     }
 
     _onUpdate(data, options, userId) {
@@ -79,8 +82,17 @@ Hooks.once("setup", () => {
     }
 
     _onDragLeftCancel(event, ...args) {
+      // v14 calls this for completed drops and releases too, and guards against
+      // them before touching waypoints. Honour those cases first, otherwise a
+      // drop would get an extra waypoint appended instead of committing.
+      // (_smStartPx is left alone here: _onDragLeftDrop owns its lifecycle, and
+      // clearing it early would make a pending drop fall through to vanilla.)
+      const id = event?.interactionData;
+      if (id?.cancelled || id?.dropped || id?.released) {
+        return super._onDragLeftCancel(event, ...args);
+      }
       if (this._smStartPx) {
-        const ctx = event?.interactionData?.contexts?.[this.document.id];
+        const ctx = id?.contexts?.[this.document.id];
         if (ctx?.waypoints) {
           const isCtrl = event.ctrlKey || event.metaKey;
           if (isCtrl) this._removeDragWaypoint?.();
@@ -243,6 +255,7 @@ Hooks.once("ready", () => {
       delete t._smCommitting;
       delete t._smBaseScale;
       delete t._smRunFt;
+      delete t._smVisTick;
       if (t.mesh) t.mesh.alpha = 1;
     }
     TokenEffects.instance.destroy();
@@ -319,46 +332,71 @@ function syncPosAndPerception(token) {
 }
 
 // Recompute whether the mesh should be visible to THIS client at the token's
-// current animated position. Mirrors Foundry's Token#isVisible (foundry.mjs
-// _refreshVisibility, which core runs every frame via refreshVisibility flag).
-// We bypass that pipeline by moving the mesh directly, so without this a token
+// current animated position. Mirrors Foundry's Token#isVisible, which core
+// normally re-evaluates every frame via the refreshVisibility render flag. We
+// bypass that pipeline by moving the mesh directly, so without this a token
 // dragged behind a wall / out of sight by the GM would keep showing its motion
 // to players until the final commit. GM and owned/controlled tokens are skipped.
+//
+// v14 changed the test: isVisible now uses document.getVisibilityTestPoints()
+// with tolerance 0 instead of a single center point with a computed tolerance.
+// Those points are "dense" (5 on a square grid, up to 9 gridless), so the test
+// costs several times what it did in v13 — hence the throttle in the caller.
 function updateMeshVisibility(token) {
   if (game.user?.isGM) return;
   const mesh = token.mesh;
   if (!mesh) return;
-  if (token.controlled) return;
+  if (token.controlled || token.isPreview) return;
   if (token.document?.hidden) { mesh.visible = false; return; }
   if (!canvas.visibility?.tokenVision) return;
   if (token.vision?.active) return;
-  const { width, height } = token.document.getSize();
-  const tol = Math.min(width, height) / 4;
-  const visible = canvas.visibility.testVisibility(
-    { x: mesh.position.x, y: mesh.position.y },
-    { tolerance: tol, object: token },
-  );
+  const doc = token.document;
+  const x = mesh.position.x - (token.w ?? 0) / 2;
+  const y = mesh.position.y - (token.h ?? 0) / 2;
+  let visible;
+  if (typeof doc.getVisibilityTestPoints === "function") {
+    visible = canvas.visibility.testVisibility(
+      doc.getVisibilityTestPoints({ x, y }), { tolerance: 0, object: token });
+  } else {
+    const { width, height } = doc.getSize();
+    visible = canvas.visibility.testVisibility(
+      { x: mesh.position.x, y: mesh.position.y },
+      { tolerance: Math.min(width, height) / 4, object: token });
+  }
   mesh.visible = visible && token.renderable;
 }
+
+// How many frames between fog-of-war visibility re-tests during an animation.
+// v14's visibility test evaluates a dense point set (5 on a square grid, up to
+// 9 gridless) against every active vision source, so running it on all 60 frames
+// is needlessly expensive. Every 4th frame is ~15Hz — visually indistinguishable
+// for a token fading in/out at a wall, at a quarter of the cost.
+const VIS_TEST_EVERY = 4;
 
 // Per-frame upkeep during our custom animation, mirroring what core Foundry
 // does in Token#_onAnimationUpdate (which we bypass by moving the mesh directly).
 // Light/vision sources are only re-initialized when the token actually has sight
 // or emits light AND the user has Vision Animation enabled — exactly Foundry's
 // own guard, so we don't pay the per-frame perception cost for tokens that need
-// neither, nor when the user has opted out for FPS. Mesh visibility is always
-// refreshed (cheap point test) so fog-of-war stays correct mid-animation.
+// neither, nor when the user has opted out for FPS.
 function refreshDuringAnimation(token) {
   if (game.settings.get("core", "visionAnimation")
       && (token.hasSight || token._isLightSource?.())) {
     token.initializeSources?.();
   }
-  updateMeshVisibility(token);
+  // Always test on the first frame so a token that starts out of sight is
+  // hidden immediately; throttle afterwards. The exact final state is settled
+  // by Foundry's own refresh once the animation releases the mesh.
+  const n = token._smVisTick = (token._smVisTick ?? 0) + 1;
+  if (n === 1 || n % VIS_TEST_EVERY === 0) updateMeshVisibility(token);
 }
 
 function getMoveMode(token) {
   return (
-    token.dragActionHandler?.currentAction
+    // v14 exposes the in-progress drag action on the layer; v13 had it on the
+    // token's dragActionHandler. Fall back to the document's action either way.
+    token.layer?._dragMovementAction
+    ?? token.dragActionHandler?.currentAction
     ?? token.document?.movementAction
     ?? token.document?.getFlag?.("aeris-tokens", "movementAction")
     ?? "walk"
@@ -624,6 +662,7 @@ async function animate(token, waypoints, mode) {
     delete token._smActive;
     delete token._smBaseScale;
     delete token._smRunFt;
+    delete token._smVisTick;
     if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
     // Re-derive the final size from the document so any drift can't persist —
     // but only once the texture is loaded, or resize would compute a giant scale.
@@ -1475,7 +1514,9 @@ class TokenEffects {
     const now = performance.now();
 
     if (this._darkFilters) {
-      const darkness = canvas.scene?.darkness ?? 0;
+      // v14: Scene#darkness is gone; the live level is canvas.darknessLevel
+      // (= canvas.environment.darknessLevel), which is what core reads too.
+      const darkness = canvas.darknessLevel ?? canvas.scene?.darkness ?? 0;
       if (darkness !== this._lastDarkness) {
         this._lastDarkness = darkness;
         const containers = Object.values(this.containers);
