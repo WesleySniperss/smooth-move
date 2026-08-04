@@ -187,8 +187,10 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
-        // Build movement option per token: single displace waypoint bypasses wall
-        // constraints and size changes; pan:false uses the correct Foundry v13 option name.
+        // Build movement option per token: a single displace waypoint bypasses wall
+        // constraints and size changes. pan:false is what suppresses the camera —
+        // v14 Token#_onUpdate only pans when `options.pan !== false`. We never pan
+        // the canvas ourselves either, so the camera cannot chase a stale position.
         const movement = {};
         for (const j of jobs) {
           const last = j.pts[j.pts.length - 1];
