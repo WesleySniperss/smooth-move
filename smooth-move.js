@@ -16,6 +16,15 @@ Hooks.once("init", () => {
     scope: "world", config: true,
     type: Boolean, default: false,
   });
+  game.settings.register(MODULE_ID, "trackMovement", {
+    name: "Record movement distance",
+    hint: "Commit drags as real movement so Foundry measures the distance travelled "
+        + "and records movement history (the combat movement counter advances). "
+        + "Disable to commit as an unmeasured displacement instead — the token still "
+        + "moves and animates identically, but no distance is recorded.",
+    scope: "world", config: true,
+    type: Boolean, default: true,
+  });
 });
 
 Hooks.once("setup", () => {
@@ -214,21 +223,25 @@ Hooks.once("setup", () => {
         //   size   — the waypoints carry the token's current width/height/shape.
         // The waypoints here are core's own (a handful of drag points), not our
         // grid-expanded animation path, so there is no heavy path to re-solve.
+        //
+        // The "trackMovement" setting picks between the two: on, we send the real
+        // waypoints; off, one displace waypoint to the destination (unmeasured,
+        // the pre-3.2 behaviour) as an escape hatch. Both share the guards above.
+        const track = game.settings.get(MODULE_ID, "trackMovement") ?? true;
         const movement = {};
         for (const j of jobs) {
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
           const last = j.pts[j.pts.length - 1];
-          const waypoints = j.docWPs?.length
-            ? j.docWPs
-            : [{ x: last.x - tw/2, y: last.y - th/2,
-                 elevation: j.token.document.elevation ?? 0,
-                 width: j.token.document.width ?? 1,
-                 height: j.token.document.height ?? 1,
-                 shape: j.token.document.shape,
-                 snapped: false, explicit: true, checkpoint: true }];
+          const fallback = [{ x: last.x - tw/2, y: last.y - th/2,
+            elevation: j.token.document.elevation ?? 0,
+            width: j.token.document.width ?? 1,
+            height: j.token.document.height ?? 1,
+            shape: j.token.document.shape,
+            snapped: false, explicit: true, checkpoint: true }];
+          const real = track && j.docWPs?.length;
           movement[j.token.id] = {
-            waypoints,
-            method: "dragging",
+            waypoints: real ? j.docWPs : fallback.map(w => ({ ...w, action: "displace" })),
+            method: real ? "dragging" : "api",
             constrainOptions: { ignoreWalls: true, ignoreCost: true },
             autoRotate: false,
             showRuler: false,
