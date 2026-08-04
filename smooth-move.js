@@ -1,9 +1,8 @@
 /**
- * smooth-move.js — Foundry VTT v13
+ * smooth-move.js — Foundry VTT v14
  */
 
 const MODULE_ID = "smooth-move";
-console.log("[smooth-move] FILE LOADED");
 
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "animMs", {
@@ -233,7 +232,9 @@ Hooks.once("ready", () => {
     if (msg.type !== "smMove") return;
     if (msg.userId === game.user?.id) return;   // ignore own messages (Foundry echoes back)
     if (msg.sceneId !== canvas.scene?.id) return;
-    if (msg.pts?.length < 2) return;
+    // Note the shape: `msg.pts?.length < 2` would NOT catch a missing pts,
+    // because `undefined < 2` is false — and then pts[0] below would throw.
+    if (!(msg.pts?.length >= 2)) return;
     const token = canvas.tokens?.get(msg.tokenId);
     if (!token?.mesh || token._smActive) return;
     // Hidden tokens are never rendered to non-GM clients — skip the pointless
@@ -274,8 +275,6 @@ const eio   = t => t < 0.5 ? 2*t*t : -1+(4-2*t)*t;
 const eio4  = t => t < 0.5 ? 8*t*t*t*t : 1 - 8*(1-t)*(1-t)*(1-t)*(1-t);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const animMs = () => game.settings.get(MODULE_ID, "animMs") ?? 900;
-
-function playStepSound(_i) {}
 
 // True only when the token's texture is actually loaded. Foundry's _refreshSize
 // computes mesh scale as baseWidth / texture.width (primary-sprite-mesh resize);
@@ -604,17 +603,33 @@ const PROFILES = {
   climb:  { kind: "step",   mult: 1.2, ease: eio, pause: 80 },
   crawl:  { kind: "cont",   mult: 1.0, ease: eio },
   burrow: { kind: "cont",   mult: 2.0, ease: eio },
+  jump:   { kind: "walk",   mult: 1.0 },
   teleport: { kind: "teleport", mult: 0.8 },
   blink:    { kind: "teleport", mult: 0.8 },
   tp:       { kind: "teleport", mult: 0.8 },
 };
+
+// Pick the animation profile for a movement action. Actions we don't map
+// explicitly still have meaning in core's CONFIG.Token.movement.actions, so
+// derive their behaviour from there rather than always walking:
+//   - speedMultiplier Infinity  => instant (core's "displace": paste, undo, and
+//     the waypoint our own commit uses). Animating it would be plain wrong.
+//   - teleport: true            => our teleport profile.
+// Anything else (core "jump", or actions added by a system/module) walks.
+// Returning null means "do not animate at all".
+function profileFor(mode) {
+  const cfg = CONFIG.Token?.movement?.actions?.[mode];
+  if (cfg?.speedMultiplier === Infinity) return null;
+  return PROFILES[mode] ?? (cfg?.teleport ? PROFILES.teleport : PROFILES.walk);
+}
 
 async function animate(token, waypoints, mode) {
   if (!waypoints || waypoints.length < 2) return;
   const totalMs = animMs();
   if (totalMs <= 0) return;
 
-  const prof = PROFILES[mode] ?? PROFILES.walk;
+  const prof = profileFor(mode);
+  if (!prof) return;
   const dur  = totalMs * prof.mult;
   const gs   = canvas.grid.size ?? 100;
   // Capture the TRUE base scale, never the live mesh scale mid-bounce. The walk
@@ -1461,13 +1476,11 @@ class TokenEffects {
       const effectParent = canvas.stage;
       effectParent.addChild(burrowContainer, runContainer, flightContainer);
 
-      console.log('[smooth-move] baking textures…');
       const blobTex    = bakeBlobTexture(64);
       const puffTexs   = [7, 20, 33, 46, 59, 72].map(s => bakePuffTexture(s, 128));
       const dustTexs   = [3, 17, 31, 47, 59, 73].map(s => bakeDustTexture(s, 96));
       const pebbleTexs = [11, 23, 37, 53, 67, 83, 97, 109].map(s => bakePebbleTexture(s, 16));
       const clodTexs   = [3, 17, 31, 47, 59, 73, 89, 101, 113, 127].map(s => bakeClodTexture(s, 24));
-      console.log('[smooth-move] textures baked, blob valid:', blobTex?.width > 0);
 
       this.containers = { flight: flightContainer, run: runContainer, burrow: burrowContainer };
       this.textures = { blob: blobTex, puffs: puffTexs, dust: dustTexs, pebbles: pebbleTexs, clods: clodTexs };
@@ -1479,8 +1492,6 @@ class TokenEffects {
 
       this._tickBound = this._onTick.bind(this);
       canvas.app.ticker.add(this._tickBound);
-      window._smTE = this;
-      console.log('[smooth-move] init() complete — ticker running');
     } catch (err) {
       console.error('[smooth-move] init() FAILED:', err);
     }
@@ -1558,7 +1569,6 @@ class TokenEffects {
     const gridSize    = Math.max(token.document?.width ?? 1, token.document?.height ?? 1);
     const gridPx      = canvas.dimensions?.size ?? 100;
     const tScale      = (gridSize * gridPx) / 100;   // 1.0 = 100px reference token
-    const isBurrowing = getMoveMode(token) === 'burrow';
 
     let st = this.states.get(token.id);
     if (!st) {
@@ -1578,6 +1588,10 @@ class TokenEffects {
 
     const isMoving = st.smoothSpeed > CFG.moveThreshold;
     const isFlying = elevationFt > 0;
+    // This runs for every token on every frame, and getMoveMode allocates (it
+    // lowercases). It only matters while burrowing or while undoing the burrow
+    // alpha, so don't pay for it on idle tokens.
+    const isBurrowing = (isMoving || st.wasBurrowing) && getMoveMode(token) === 'burrow';
 
     if (isMoving) st.distanceMovedFt += inst * ftPerPx;
     if (isFlying && elevationFt > st.peakElevationFt) st.peakElevationFt = elevationFt;
@@ -1684,7 +1698,6 @@ async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
         }
         if (k >= 1) {
           canvas.app.ticker.remove(tick);
-          playStepSound(i);
           res();
         }
       };

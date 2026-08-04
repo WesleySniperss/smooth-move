@@ -2,14 +2,15 @@
   "id": "smooth-move",
   "title": "Smooth Move",
   "description": "White measurement line with dots every 5 ft while dragging. Right-click to anchor waypoints. Smooth path-following animation on drop.",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "compatibility": {
     "minimum": "14",
     "verified": "14"
   },
   "socket": true,
   "esmodules": ["smooth-move.js"],
-  "authors": [{ "name": "Vlad" }],
+  "authors": [{ "name": "Vlad", "url": "https://github.com/WesleySniperss" }],
+  "url": "https://github.com/WesleySniperss/smooth-move",
   "manifest": "https://raw.githubusercontent.com/WesleySniperss/smooth-move/master/module.json",
   "download": "https://github.com/WesleySniperss/smooth-move/archive/refs/heads/master.zip"
 }
