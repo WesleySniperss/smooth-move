@@ -302,10 +302,13 @@ Hooks.once("ready", () => {
     }
     TokenEffects.instance.destroy();
     TokenEffects.instance.init();
+    // Kept independent of TokenEffects: that init() swallows its own errors, and
+    // a safety net must not be disabled by an unrelated particle failure.
+    startSizeWatchdog();
   });
-  Hooks.on("canvasTearDown", () => TokenEffects.instance.destroy());
+  Hooks.on("canvasTearDown", () => { TokenEffects.instance.destroy(); stopSizeWatchdog(); });
   Hooks.on("deleteToken",    (doc) => TokenEffects.instance._dropToken(doc.id));
-  if (canvas?.ready) TokenEffects.instance.init();
+  if (canvas?.ready) { TokenEffects.instance.init(); startSizeWatchdog(); }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -354,6 +357,59 @@ function documentScale(token) {
     default:        sx = size.width / tw; sy = size.height / th; break; // "fill"
   }
   return { x: Math.abs(sx * scaleX), y: Math.abs(sy * scaleY) };
+}
+
+// ── Size watchdog ────────────────────────────────────────────────────────────
+// documentScale() already clamps OUR animation base, so this module cannot
+// inflate a token. Nothing stops a third party from doing it though, and an
+// inflated mesh.scale persists until something re-derives it from the document
+// (which is why the old "giant tokens" needed a reload to clear).
+//
+// The threshold is the whole point. Plenty of modules legitimately animate
+// token scale — pulsing auras, hit flashes, target highlights — and those move
+// it by a few percent. Forcing every token to its exact document scale would
+// break all of them. Catastrophic inflation was 10-100x, so a 3x floor
+// separates the two cleanly: no real effect reaches it, no giant escapes it.
+const SIZE_WATCHDOG_FACTOR = 3;
+const SIZE_WATCHDOG_MS = 1000;
+
+function sizeWatchdogSweep() {
+  for (const token of canvas.tokens?.placeables ?? []) {
+    if (token._smActive || token._smCommitting) continue;  // our animation owns it
+    if (token.isPreview) continue;                         // drag ghost
+    if (token.animationContexts?.size) continue;           // core is animating it
+    const mesh = token.mesh;
+    if (!mesh) continue;
+    const ds = documentScale(token);                       // null until texture loads
+    if (!ds) continue;
+    const fx = Math.abs(mesh.scale.x) / ds.x;
+    const fy = Math.abs(mesh.scale.y) / ds.y;
+    if (fx <= SIZE_WATCHDOG_FACTOR && fy <= SIZE_WATCHDOG_FACTOR) continue;
+    console.warn(`[smooth-move] "${token.document?.name ?? token.id}" was rendering at `
+      + `${Math.max(fx, fy).toFixed(1)}x its correct size — resetting from the document. `
+      + `smooth-move clamps its own animation, so something else scaled this token.`);
+    try { token._refreshSize?.(); } catch (_) {}
+  }
+}
+
+function startSizeWatchdog() {
+  if (sizeWatchdogSweep._tick) return;
+  let acc = 0;
+  const tick = () => {
+    acc += canvas.app.ticker.deltaMS || 16.667;
+    if (acc < SIZE_WATCHDOG_MS) return;
+    acc = 0;
+    sizeWatchdogSweep();
+  };
+  sizeWatchdogSweep._tick = tick;
+  canvas.app.ticker.add(tick);
+}
+
+function stopSizeWatchdog() {
+  const tick = sizeWatchdogSweep._tick;
+  if (!tick) return;
+  canvas.app?.ticker?.remove(tick);
+  delete sizeWatchdogSweep._tick;
 }
 
 function syncPos(token) {
