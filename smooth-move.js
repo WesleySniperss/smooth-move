@@ -112,6 +112,13 @@ Hooks.once("setup", () => {
       const startPx = this._smStartPx;
       if (!startPx) return super._onDragLeftDrop(event, ...args);
 
+      // v14's Token#_onDragLeftDrop marks the interaction as dropped before
+      // delegating, and _onDragLeftCancel keys off that flag to tear the drag
+      // down instead of treating the release as a waypoint click. We take over
+      // the drop and never reached core's assignment, so cancel fell through to
+      // _addDragWaypoint and left a stray ruler dot on the map after every drag.
+      if (event?.interactionData) event.interactionData.dropped = true;
+
       // Only the first selected token to drop handles the group — others are animated via _onUpdate
       if (this.layer?._smGroupDrop) { delete this._smStartPx; return; }
 
@@ -147,7 +154,14 @@ Hooks.once("setup", () => {
         const raw     = skip ? [tStart, ...meshWPs.slice(1)] : [tStart, ...meshWPs];
         const tMode   = getMoveMode(t);
         const pts     = (tMode === "walk" || tMode === "climb") ? expandToGridCells(raw, t) : raw;
-        jobs.push({ token: t, pts, mode: tMode, upd });
+        // expandToGridCells snaps to cell centres. The document now lands on the
+        // real (possibly unsnapped, e.g. shift-drag) final waypoint, so pin the
+        // last animation point to it — otherwise the token jumps up to half a
+        // cell when the commit overwrites our endpoint.
+        if (pts.length > 1) pts[pts.length - 1] = meshWPs[meshWPs.length - 1];
+        // Keep core's own waypoints (document space, full field set, real action)
+        // so the commit can be measured exactly as vanilla would measure it.
+        jobs.push({ token: t, pts, mode: tMode, upd, docWPs: tWPs });
       }
 
       if (!jobs.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
@@ -187,22 +201,34 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
-        // Build movement option per token: a single displace waypoint bypasses wall
-        // constraints and size changes. pan:false is what suppresses the camera —
-        // v14 Token#_onUpdate only pans when `options.pan !== false`. We never pan
-        // the canvas ourselves either, so the camera cannot chase a stale position.
+        // Commit the player's real waypoints under their real movement action, so
+        // Foundry measures the distance actually travelled and records movement
+        // history — a "displace" waypoint carries measure:false and
+        // costMultiplier:0, which made every drag register as zero movement.
+        //
+        // What keeps the old bugs away is NOT the displace action:
+        //   walls  — constrainOptions.ignoreWalls, which short-circuits every
+        //            collision test in Token#constrainMovementPath.
+        //   camera — pan:false; v14 Token#_onUpdate only pans when
+        //            `options.pan !== false`, and we never pan the canvas ourselves.
+        //   size   — the waypoints carry the token's current width/height/shape.
+        // The waypoints here are core's own (a handful of drag points), not our
+        // grid-expanded animation path, so there is no heavy path to re-solve.
         const movement = {};
         for (const j of jobs) {
-          const last = j.pts[j.pts.length - 1];
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
+          const last = j.pts[j.pts.length - 1];
+          const waypoints = j.docWPs?.length
+            ? j.docWPs
+            : [{ x: last.x - tw/2, y: last.y - th/2,
+                 elevation: j.token.document.elevation ?? 0,
+                 width: j.token.document.width ?? 1,
+                 height: j.token.document.height ?? 1,
+                 shape: j.token.document.shape,
+                 snapped: false, explicit: true, checkpoint: true }];
           movement[j.token.id] = {
-            waypoints: [{ x: last.x - tw/2, y: last.y - th/2,
-              elevation: j.token.document.elevation ?? 0,
-              width: j.token.document.width ?? 1,
-              height: j.token.document.height ?? 1,
-              shape: j.token.document.shape,
-              action: "displace", snapped: false, explicit: true, checkpoint: true }],
-            method: "api",
+            waypoints,
+            method: "dragging",
             constrainOptions: { ignoreWalls: true, ignoreCost: true },
             autoRotate: false,
             showRuler: false,
