@@ -17,13 +17,15 @@ Hooks.once("init", () => {
     type: Boolean, default: false,
   });
   game.settings.register(MODULE_ID, "trackMovement", {
-    name: "Record movement distance",
-    hint: "Commit drags as real movement so Foundry measures the distance travelled "
-        + "and records movement history (the combat movement counter advances). "
-        + "Disable to commit as an unmeasured displacement instead — the token still "
-        + "moves and animates identically, but no distance is recorded.",
+    name: "Record movement distance (experimental)",
+    hint: "EXPERIMENTAL — off by default because it is known to misbehave. When on, "
+        + "drags commit as real movement so Foundry measures the distance travelled "
+        + "and the combat movement counter advances; but this has been reported to "
+        + "make a move start from the wrong point and to disturb the camera. Leave "
+        + "off unless you are testing it: the token still moves and animates "
+        + "identically either way, only the distance is not recorded.",
     scope: "world", config: true,
-    type: Boolean, default: true,
+    type: Boolean, default: false,
   });
 });
 
@@ -217,24 +219,24 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
-        // Commit the player's real waypoints under their real movement action, so
-        // Foundry measures the distance actually travelled and records movement
-        // history — a "displace" waypoint carries measure:false and
-        // costMultiplier:0, which made every drag register as zero movement.
+        // Default: one "displace" waypoint straight to the destination. It is
+        // unmeasured (measure:false, costMultiplier:0), so no distance is recorded
+        // — but it is the only form of commit that has proven stable here.
         //
-        // What keeps the old bugs away is NOT the displace action:
-        //   walls  — constrainOptions.ignoreWalls, which short-circuits every
-        //            collision test in Token#constrainMovementPath.
-        //   camera — pan:false; v14 Token#_onUpdate only pans when
-        //            `options.pan !== false`, and we never pan the canvas ourselves.
-        //   size   — the waypoints carry the token's current width/height/shape.
-        // The waypoints here are core's own (a handful of drag points), not our
-        // grid-expanded animation path, so there is no heavy path to re-solve.
+        // Committing the real waypoints instead DOES record distance, and reading
+        // the v14 source suggested it was safe: walls are bypassed by
+        // constrainOptions.ignoreWalls, the camera by pan:false, and size by the
+        // waypoints carrying the token's own dimensions. In play it was not — it
+        // made moves start from the wrong point and disturbed the camera, the same
+        // family of bugs displace was adopted to avoid. So that path is now behind
+        // the off-by-default "trackMovement" setting, for testing only.
         //
-        // The "trackMovement" setting picks between the two: on, we send the real
-        // waypoints; off, one displace waypoint to the destination (unmeasured,
-        // the pre-3.2 behaviour) as an escape hatch. Both share the guards above.
-        const track = game.settings.get(MODULE_ID, "trackMovement") ?? true;
+        // If it is revisited: method "dragging" pulls the commit into core's drag
+        // and planned-movement machinery (showRuler, _plannedMovement,
+        // recalculatePlannedMovementPath). "api" is the more likely-correct method
+        // for a commit we have already animated ourselves, and is what the
+        // experimental path now sends — but this is untested.
+        const track = game.settings.get(MODULE_ID, "trackMovement") ?? false;
         const movement = {};
         for (const j of jobs) {
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
@@ -248,7 +250,7 @@ Hooks.once("setup", () => {
           const real = track && j.docWPs?.length;
           movement[j.token.id] = {
             waypoints: real ? j.docWPs : fallback.map(w => ({ ...w, action: "displace" })),
-            method: real ? "dragging" : "api",
+            method: "api",
             constrainOptions: { ignoreWalls: true, ignoreCost: true },
             autoRotate: false,
             showRuler: false,
