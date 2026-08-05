@@ -1,8 +1,8 @@
 {
   "id": "smooth-move",
   "title": "Smooth Move",
-  "description": "White measurement line with dots every 5 ft while dragging. Right-click to anchor waypoints. Smooth path-following animation on drop.",
-  "version": "3.6.0",
+  "description": "Tokens animate along the path you actually dragged, with a movement style per action — stepping walks, gliding flight, swimming wobble, burrowing, and a teleport effect for blinks. Right-click during a drag to anchor a waypoint. Paths are synced over the socket so every player sees the same motion, fog of war stays correct mid-move, and distance is recorded as normal.",
+  "version": "3.6.1",
   "compatibility": {
     "minimum": "14",
     "verified": "14"
