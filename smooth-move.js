@@ -16,17 +16,6 @@ Hooks.once("init", () => {
     scope: "world", config: true,
     type: Boolean, default: false,
   });
-  game.settings.register(MODULE_ID, "trackMovement", {
-    name: "Record movement distance (experimental)",
-    hint: "EXPERIMENTAL — off by default because it is known to misbehave. When on, "
-        + "drags commit as real movement so Foundry measures the distance travelled "
-        + "and the combat movement counter advances; but this has been reported to "
-        + "make a move start from the wrong point and to disturb the camera. Leave "
-        + "off unless you are testing it: the token still moves and animates "
-        + "identically either way, only the distance is not recorded.",
-    scope: "world", config: true,
-    type: Boolean, default: false,
-  });
 });
 
 Hooks.once("setup", () => {
@@ -172,14 +161,12 @@ Hooks.once("setup", () => {
         const tProf   = profileFor(tMode);
         const stepped = tProf?.kind === "walk" || tProf?.kind === "step";
         const pts     = stepped ? expandToGridCells(raw, t) : raw;
-        // expandToGridCells snaps to cell centres. The document now lands on the
-        // real (possibly unsnapped, e.g. shift-drag) final waypoint, so pin the
-        // last animation point to it — otherwise the token jumps up to half a
-        // cell when the commit overwrites our endpoint.
+        // expandToGridCells snaps to cell centres, which would move an unsnapped
+        // drop (shift-drag) up to half a cell off target — and the commit takes
+        // its destination from this last point, so the token would settle there
+        // too. Pin it back to the real final waypoint.
         if (pts.length > 1) pts[pts.length - 1] = meshWPs[meshWPs.length - 1];
-        // Keep core's own waypoints (document space, full field set, real action)
-        // so the commit can be measured exactly as vanilla would measure it.
-        jobs.push({ token: t, pts, mode: tMode, upd, docWPs: tWPs });
+        jobs.push({ token: t, pts, mode: tMode, upd });
       }
 
       if (!jobs.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
@@ -219,37 +206,32 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
-        // Default: one "displace" waypoint straight to the destination. It is
-        // unmeasured (measure:false, costMultiplier:0), so no distance is recorded
-        // — but it is the only form of commit that has proven stable here.
+        // Commit as a single "displace" waypoint straight to the destination.
+        // displace is unmeasured (measure:false, costMultiplier:0), so travelled
+        // distance is NOT recorded — that is a deliberate trade, not an oversight.
         //
-        // Committing the real waypoints instead DOES record distance, and reading
-        // the v14 source suggested it was safe: walls are bypassed by
-        // constrainOptions.ignoreWalls, the camera by pan:false, and size by the
-        // waypoints carrying the token's own dimensions. In play it was not — it
-        // made moves start from the wrong point and disturbed the camera, the same
-        // family of bugs displace was adopted to avoid. So that path is now behind
-        // the off-by-default "trackMovement" setting, for testing only.
+        // v3.2.0 committed the real waypoints under their real action instead,
+        // which does record distance. Reading the v14 source it looked safe: walls
+        // bypassed by constrainOptions.ignoreWalls, camera by pan:false, size by
+        // the waypoints carrying the token's own dimensions. In play it was not —
+        // moves began from the wrong point and the camera misbehaved, the same
+        // family of bugs displace was adopted to avoid. Reverted in v3.8.0.
         //
-        // If it is revisited: method "dragging" pulls the commit into core's drag
-        // and planned-movement machinery (showRuler, _plannedMovement,
-        // recalculatePlannedMovementPath). "api" is the more likely-correct method
-        // for a commit we have already animated ourselves, and is what the
-        // experimental path now sends — but this is untested.
-        const track = game.settings.get(MODULE_ID, "trackMovement") ?? false;
+        // If this is ever revisited, start with `method`: "dragging" pulls the
+        // commit into core's drag and planned-movement machinery (showRuler,
+        // _plannedMovement, recalculatePlannedMovementPath), which a commit we
+        // have already animated ourselves has no business re-entering.
         const movement = {};
         for (const j of jobs) {
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
           const last = j.pts[j.pts.length - 1];
-          const fallback = [{ x: last.x - tw/2, y: last.y - th/2,
-            elevation: j.token.document.elevation ?? 0,
-            width: j.token.document.width ?? 1,
-            height: j.token.document.height ?? 1,
-            shape: j.token.document.shape,
-            snapped: false, explicit: true, checkpoint: true }];
-          const real = track && j.docWPs?.length;
           movement[j.token.id] = {
-            waypoints: real ? j.docWPs : fallback.map(w => ({ ...w, action: "displace" })),
+            waypoints: [{ x: last.x - tw/2, y: last.y - th/2,
+              elevation: j.token.document.elevation ?? 0,
+              width: j.token.document.width ?? 1,
+              height: j.token.document.height ?? 1,
+              shape: j.token.document.shape,
+              action: "displace", snapped: false, explicit: true, checkpoint: true }],
             method: "api",
             constrainOptions: { ignoreWalls: true, ignoreCost: true },
             autoRotate: false,
