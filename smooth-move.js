@@ -715,9 +715,19 @@ const PROFILES = {
 // Anything else (core "jump", or actions added by a system/module) walks.
 // Returning null means "do not animate at all".
 function profileFor(mode) {
+  // Our explicit mapping wins. This matters for "blink", the selectable
+  // teleport action: it carries speedMultiplier: Infinity exactly like the
+  // internal "displace", so keying on that field alone silently dropped its
+  // animation entirely instead of playing the teleport effect.
+  const p = PROFILES[mode];
+  if (p) return p;
   const cfg = CONFIG.Token?.movement?.actions?.[mode];
-  if (cfg?.speedMultiplier === Infinity) return null;
-  return PROFILES[mode] ?? (cfg?.teleport ? PROFILES.teleport : PROFILES.walk);
+  if (!cfg) return PROFILES.walk;
+  // measure:false marks repositioning rather than in-world movement — core's
+  // "displace" (paste, undo, and the commit we send when tracking is off).
+  // Those must not animate. Everything else does, as a teleport or a walk.
+  if (cfg.measure === false) return null;
+  return cfg.teleport ? PROFILES.teleport : PROFILES.walk;
 }
 
 async function animate(token, waypoints, mode) {
