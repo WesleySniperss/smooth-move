@@ -162,7 +162,14 @@ Hooks.once("setup", () => {
         const skip    = Math.abs(first.x - tStart.x) < 2 && Math.abs(first.y - tStart.y) < 2;
         const raw     = skip ? [tStart, ...meshWPs.slice(1)] : [tStart, ...meshWPs];
         const tMode   = getMoveMode(t);
-        const pts     = (tMode === "walk" || tMode === "climb") ? expandToGridCells(raw, t) : raw;
+        // Decide this from the resolved profile, not the action name: animate()
+        // dispatches on prof.kind, so keying on the name meant "jump" (and any
+        // action falling back to the walk profile) went to animWalk WITHOUT
+        // being split into cells — one giant bouncing stride per waypoint
+        // instead of a step per square, and a wrong _smRunFt for the dust FX.
+        const tProf   = profileFor(tMode);
+        const stepped = tProf?.kind === "walk" || tProf?.kind === "step";
+        const pts     = stepped ? expandToGridCells(raw, t) : raw;
         // expandToGridCells snaps to cell centres. The document now lands on the
         // real (possibly unsnapped, e.g. shift-drag) final waypoint, so pin the
         // last animation point to it — otherwise the token jumps up to half a
@@ -1948,7 +1955,10 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
     canvas.app.ticker.add(tick);
   });
 
-  if(token.mesh){token.mesh.alpha=0;token.mesh.position.set(dest.x,dest.y);syncPos(token);} gfx.clear();
+  // The token is now at the destination. Re-test fog before it fades back in,
+  // otherwise a token blinking somewhere the viewer cannot see would visibly
+  // materialise there and only be hidden once the animation released the mesh.
+  if(token.mesh){token.mesh.alpha=0;token.mesh.position.set(dest.x,dest.y);syncPos(token);refreshDuringAnimation(token);} gfx.clear();
 
   await new Promise(res => {
     const t0=performance.now();

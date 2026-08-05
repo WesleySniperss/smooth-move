@@ -2,7 +2,7 @@
   "id": "smooth-move",
   "title": "Smooth Move",
   "description": "White measurement line with dots every 5 ft while dragging. Right-click to anchor waypoints. Smooth path-following animation on drop.",
-  "version": "3.5.0",
+  "version": "3.6.0",
   "compatibility": {
     "minimum": "14",
     "verified": "14"
