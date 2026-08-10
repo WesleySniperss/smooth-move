@@ -406,10 +406,23 @@ function stopSizeWatchdog() {
 function syncPos(token) {
   const mesh = token.mesh;
   if (!mesh) return;
-  Object.assign(token, {
-    x: mesh.position.x - (token.w ?? 0) / 2,
-    y: mesh.position.y - (token.h ?? 0) / 2,
-  });
+  const x = mesh.position.x - (token.w ?? 0) / 2;
+  const y = mesh.position.y - (token.h ?? 0) / 2;
+  Object.assign(token, { x, y });
+
+  // Core's own animation writes each interpolated frame straight into the
+  // document (Token##animateFrame: mergeObject(this.document, #animationData)).
+  // That matters because everything positional reads the DOCUMENT, not the mesh:
+  // Token#center, initializeSources() via document.getCenterPoint(), camera
+  // follow, and third-party modules. Moving only the mesh left the document
+  // parked at the origin for the whole animation, so vision, light and any
+  // camera stayed at the start point and snapped across only at commit — the
+  // token and the viewer's perspective visibly desynced.
+  //
+  // Only the prepared document is touched; _source is untouched, so nothing is
+  // persisted or broadcast, and the commit still diffs against the true origin.
+  const doc = token.document;
+  if (doc) { doc.x = x; doc.y = y; }
 }
 
 function syncPosAndPerception(token) {
