@@ -288,7 +288,7 @@ Hooks.once("ready", () => {
       delete t._smCommitting;
       delete t._smBaseScale;
       delete t._smRunFt;
-      delete t._smVisTick;
+      delete t._smTick;
       if (t.mesh) t.mesh.alpha = 1;
     }
     TokenEffects.instance.destroy();
@@ -473,22 +473,35 @@ function updateMeshVisibility(token) {
 // for a token fading in/out at a wall, at a quarter of the cost.
 const VIS_TEST_EVERY = 4;
 
+// How many frames between light/vision source updates during an animation.
+// initializeSources() rebuilds the source's line-of-sight polygon whenever the
+// position actually changed (BaseEffectSource#initialize -> _couldShapesChange
+// -> _createShapes), which is the single most expensive thing we do per frame.
+// Core runs it every frame; at 3 we run it at ~20Hz for a third of the cost.
+// The token mesh still moves at full framerate — only the lit area steps, and
+// a soft light gradient hides that far better than a hard edge would. Raise
+// for more savings, lower (2, or 1 to match core exactly) for tighter light.
+const SOURCE_EVERY = 3;
+
 // Per-frame upkeep during our custom animation, mirroring what core Foundry
 // does in Token#_onAnimationUpdate (which we bypass by moving the mesh directly).
-// Light/vision sources are only re-initialized when the token actually has sight
-// or emits light AND the user has Vision Animation enabled — exactly Foundry's
-// own guard, so we don't pay the per-frame perception cost for tokens that need
-// neither, nor when the user has opted out for FPS.
+// Both jobs are throttled, and both always run on the first frame so nothing is
+// visibly stale at the start. The exact final state is settled either way by
+// syncPosAndPerception() once the animation releases the mesh.
 function refreshDuringAnimation(token) {
-  if (game.settings.get("core", "visionAnimation")
+  const n = token._smTick = (token._smTick ?? 0) + 1;
+  const first = n === 1;
+
+  // Sources are only touched for tokens that actually have sight or emit light,
+  // and only when Vision Animation is enabled — exactly Foundry's own guard, so
+  // we never pay this for tokens that need neither, nor for a user who opted out.
+  if ((first || (n % SOURCE_EVERY === 0))
+      && game.settings.get("core", "visionAnimation")
       && (token.hasSight || token._isLightSource?.())) {
     token.initializeSources?.();
   }
-  // Always test on the first frame so a token that starts out of sight is
-  // hidden immediately; throttle afterwards. The exact final state is settled
-  // by Foundry's own refresh once the animation releases the mesh.
-  const n = token._smVisTick = (token._smVisTick ?? 0) + 1;
-  if (n === 1 || n % VIS_TEST_EVERY === 0) updateMeshVisibility(token);
+
+  if (first || (n % VIS_TEST_EVERY === 0)) updateMeshVisibility(token);
 }
 
 function getMoveMode(token) {
@@ -788,7 +801,7 @@ async function animate(token, waypoints, mode) {
     delete token._smActive;
     delete token._smBaseScale;
     delete token._smRunFt;
-    delete token._smVisTick;
+    delete token._smTick;
     if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
     // Re-derive the final size from the document so any drift can't persist —
     // but only once the texture is loaded, or resize would compute a giant scale.
