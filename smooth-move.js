@@ -16,6 +16,23 @@ Hooks.once("init", () => {
     scope: "world", config: true,
     type: Boolean, default: false,
   });
+  game.settings.register(MODULE_ID, "sourceUpdates", {
+    name: "Light and vision during movement",
+    hint: "How often a moving token's light and vision are recalculated. Rebuilding "
+        + "the line-of-sight polygon is by far the most expensive part of the "
+        + "animation, so the lower settings cost much less. This only affects what "
+        + "happens WHILE a token travels — the token always moves at full framerate, "
+        + "the path and its waypoints are unchanged, and the light and vision at the "
+        + "destination are always exact. Affects only your own client.",
+    scope: "client", config: true,
+    type: String,
+    choices: {
+      smooth:   "Continuously — smoothest, most expensive",
+      waypoint: "Once per square — light steps along the path",
+      end:      "Only when the move ends — cheapest, light stays put until arrival",
+    },
+    default: "smooth",
+  });
 });
 
 Hooks.once("setup", () => {
@@ -488,19 +505,31 @@ const SOURCE_EVERY = 3;
 // Both jobs are throttled, and both always run on the first frame so nothing is
 // visibly stale at the start. The exact final state is settled either way by
 // syncPosAndPerception() once the animation releases the mesh.
-function refreshDuringAnimation(token) {
+// `atWaypoint` is set on the frame that completes a step or crosses into a new
+// path segment — the boundaries the "waypoint" setting updates on.
+function refreshDuringAnimation(token, atWaypoint = false) {
   const n = token._smTick = (token._smTick ?? 0) + 1;
   const first = n === 1;
+
+  const mode = game.settings.get(MODULE_ID, "sourceUpdates") ?? "smooth";
+  // "end" does nothing here at all; animate()'s finally still runs
+  // syncPosAndPerception, so the destination is exact in every mode.
+  const wantSources = mode === "end" ? false
+    : mode === "waypoint" ? (first || atWaypoint)
+    : (first || (n % SOURCE_EVERY === 0));
 
   // Sources are only touched for tokens that actually have sight or emit light,
   // and only when Vision Animation is enabled — exactly Foundry's own guard, so
   // we never pay this for tokens that need neither, nor for a user who opted out.
-  if ((first || (n % SOURCE_EVERY === 0))
+  if (wantSources
       && game.settings.get("core", "visionAnimation")
       && (token.hasSight || token._isLightSource?.())) {
     token.initializeSources?.();
   }
 
+  // Deliberately NOT tied to the setting: this hides a token that walks out of
+  // the viewer's sight, which is a correctness matter, not an effect. It is also
+  // far cheaper than a source rebuild.
   if (first || (n % VIS_TEST_EVERY === 0)) updateMeshVisibility(token);
 }
 
@@ -1818,7 +1847,7 @@ async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
           token.mesh.scale.set(bsx * E, bsy * E);
           token.mesh.rotation = baseRot + rot;
           syncPos(token);
-          refreshDuringAnimation(token);
+          refreshDuringAnimation(token, k >= 1);  // k>=1 completes this square
         }
         if (k >= 1) {
           canvas.app.ticker.remove(tick);
@@ -1846,6 +1875,8 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
   let spawnTimer       = 0;
   let burstDone        = false;
 
+  let lastSeg = -1;
+
   return new Promise(res => {
     const t0 = performance.now();
     const tick = () => {
@@ -1854,8 +1885,14 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
       const d  = ease(t) * total;
       let pos  = wpts[wpts.length - 1], dirX = 0, dirY = 0;
 
-      for (const s of segs) {
+      // Track which segment we are on: this animation is continuous, so unlike
+      // animWalk/animStep it has no natural step boundary. Entering a new
+      // segment is the equivalent moment for the "waypoint" source setting.
+      let segIdx = segs.length - 1;
+      for (let si = 0; si < segs.length; si++) {
+        const s = segs[si];
         if (s.s + s.len >= d - 0.01) {
+          segIdx = si;
           const segT = s.len > 0 ? (d - s.s) / s.len : 0;
           pos  = { x: s.from.x + (s.to.x - s.from.x)*segT, y: s.from.y + (s.to.y - s.from.y)*segT };
           const dl = s.len || 1;
@@ -1863,6 +1900,8 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
           break;
         }
       }
+      const crossed = segIdx !== lastSeg;
+      lastSeg = segIdx;
 
       if (layer) {
         if (!burstDone && prof.burstEffect) {
@@ -1888,7 +1927,7 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
         if (prof.scale) { const S = prof.scale(t); token.mesh.scale.set(bsx*S, bsy*S); }
         if (prof.alpha !== undefined) token.mesh.alpha = prof.alpha(t);
         syncPos(token);
-        refreshDuringAnimation(token);
+        refreshDuringAnimation(token, crossed);
       }
       if (t >= 1) {
         canvas.app.ticker.remove(tick);
@@ -1916,7 +1955,7 @@ async function animStep(token, wpts, totalMs, prof) {
             from.y + (to.y - from.y) * prof.ease(t),
           );
           syncPos(token);
-          refreshDuringAnimation(token);
+          refreshDuringAnimation(token, t >= 1);  // t>=1 completes this step
         }
         if (t >= 1) { canvas.app.ticker.remove(tick); res(); }
       };
@@ -1968,7 +2007,7 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
   // The token is now at the destination. Re-test fog before it fades back in,
   // otherwise a token blinking somewhere the viewer cannot see would visibly
   // materialise there and only be hidden once the animation released the mesh.
-  if(token.mesh){token.mesh.alpha=0;token.mesh.position.set(dest.x,dest.y);syncPos(token);refreshDuringAnimation(token);} gfx.clear();
+  if(token.mesh){token.mesh.alpha=0;token.mesh.position.set(dest.x,dest.y);syncPos(token);refreshDuringAnimation(token,true);} gfx.clear();
 
   await new Promise(res => {
     const t0=performance.now();
