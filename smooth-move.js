@@ -1822,41 +1822,60 @@ class TokenEffects {
   }
 }
 
-async function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
+// One ticker for the whole walk, driven by elapsed wall-clock time against a
+// single anchor.
+//
+// This used to run each square as its own awaited Promise with its own t0. A
+// square can only finish on a frame boundary, so every square overran by up to
+// one frame and — because the next t0 was taken after that overrun — the error
+// ACCUMULATED. On a 20fps client that is up to 50ms per square: a twenty-square
+// walk finished about a second behind the same walk on a 60fps client, while
+// the mover's commit landed at their own earlier finish. That is the periodic
+// desync players on weak machines were seeing, and it hit walking specifically
+// because animCont (fly/swim/crawl/burrow) always used a single anchor.
+//
+// Deriving the current square from global progress removes the accumulation
+// and the one-frame-per-square floor together: total duration is now totalMs
+// on any machine, so every client lands at the same moment.
+function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
   const steps  = wpts.length - 1;
   const stepMs = totalMs / Math.max(steps, 1);
-  let svx = 0, rot = 0;
+  const frames = Math.max(stepMs / (1000/60), 1);
+  let svx = 0, rot = 0, lastStep = -1;
 
-  for (let i = 0; i < steps; i++) {
-    const fx = wpts[i].x,   fy = wpts[i].y;
-    const dx = wpts[i+1].x - fx, dy = wpts[i+1].y - fy;
+  return new Promise(res => {
+    const t0 = performance.now();
+    const tick = () => {
+      const dt  = (canvas.app.ticker.deltaMS || 16.667) / 1000;
+      const gp  = clamp((performance.now() - t0) / totalMs, 0, 1);
+      const raw = gp * steps;
+      const i   = Math.min(Math.floor(raw), steps - 1);  // current square
+      const k   = clamp(raw - i, 0, 1);                  // progress within it
 
-    await new Promise(res => {
-      const t0  = performance.now();
-      const vxf = dx / Math.max(stepMs / (1000/60), 1);
-      const tick = () => {
-        const dt = (canvas.app.ticker.deltaMS || 16.667) / 1000;
-        const k  = clamp((performance.now() - t0) / stepMs, 0, 1);
-        const ek = eio(k);
-        const E  = 1 + 0.12 * Math.sin(Math.PI * k);
-        svx += (vxf - svx) * clamp(8 * dt, 0, 1);
-        const rTgt = clamp(svx * 0.04, -Math.PI / 10, Math.PI / 10);
-        rot += (rTgt - rot) * clamp(4 * dt, 0, 1);
-        if (token.mesh) {
-          token.mesh.position.set(fx + dx * ek, fy + dy * ek);
-          token.mesh.scale.set(bsx * E, bsy * E);
-          token.mesh.rotation = baseRot + rot;
-          syncPos(token);
-          refreshDuringAnimation(token, k >= 1);  // k>=1 completes this square
-        }
-        if (k >= 1) {
-          canvas.app.ticker.remove(tick);
-          res();
-        }
-      };
-      canvas.app.ticker.add(tick);
-    });
-  }
+      const fx = wpts[i].x, fy = wpts[i].y;
+      const dx = wpts[i+1].x - fx, dy = wpts[i+1].y - fy;
+      const ek = eio(k);
+      const E  = 1 + 0.12 * Math.sin(Math.PI * k);       // per-square bounce
+      svx += (dx / frames - svx) * clamp(8 * dt, 0, 1);
+      const rTgt = clamp(svx * 0.04, -Math.PI / 10, Math.PI / 10);
+      rot += (rTgt - rot) * clamp(4 * dt, 0, 1);
+
+      if (token.mesh) {
+        token.mesh.position.set(fx + dx * ek, fy + dy * ek);
+        token.mesh.scale.set(bsx * E, bsy * E);
+        token.mesh.rotation = baseRot + rot;
+        syncPos(token);
+        refreshDuringAnimation(token, i !== lastStep || gp >= 1);
+      }
+      lastStep = i;
+
+      if (gp >= 1) {
+        canvas.app.ticker.remove(tick);
+        res();
+      }
+    };
+    canvas.app.ticker.add(tick);
+  });
 }
 
 function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
@@ -1939,30 +1958,43 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
   });
 }
 
-async function animStep(token, wpts, totalMs, prof) {
-  const stepMs = totalMs / Math.max(wpts.length - 1, 1);
+// Single-anchor for the same reason as animWalk — see the note there. The
+// climb's deliberate pause between steps is folded into the timeline rather
+// than being a setTimeout between awaited steps, which drifted twice over: once
+// per step boundary and once per timer.
+function animStep(token, wpts, totalMs, prof) {
+  const steps  = Math.max(wpts.length - 1, 1);
+  const stepMs = totalMs / steps;
   const pause  = prof.pause ?? 65;
-  for (let i = 0; i < wpts.length - 1; i++) {
-    const from = wpts[i], to = wpts[i+1];
-    const mvMs = Math.max(stepMs - pause, 40);
-    await new Promise(res => {
-      const t0 = performance.now();
-      const tick = () => {
-        const t = clamp((performance.now() - t0) / mvMs, 0, 1);
-        if (token.mesh) {
-          token.mesh.position.set(
-            from.x + (to.x - from.x) * prof.ease(t),
-            from.y + (to.y - from.y) * prof.ease(t),
-          );
-          syncPos(token);
-          refreshDuringAnimation(token, t >= 1);  // t>=1 completes this step
-        }
-        if (t >= 1) { canvas.app.ticker.remove(tick); res(); }
-      };
-      canvas.app.ticker.add(tick);
-    });
-    if (pause > 0 && i < wpts.length - 2) await new Promise(r => setTimeout(r, pause));
-  }
+  const mvMs   = Math.max(stepMs - pause, 40);
+  const span   = mvMs + pause;                 // one step's full slot
+  const total  = span * steps;
+  let lastStep = -1;
+
+  return new Promise(res => {
+    const t0 = performance.now();
+    const tick = () => {
+      const elapsed = performance.now() - t0;
+      const gp = clamp(elapsed / total, 0, 1);
+      const i  = Math.min(Math.floor(elapsed / span), steps - 1);
+      // Within the slot: move for mvMs, then hold still for the pause.
+      const t  = clamp((elapsed - (i * span)) / mvMs, 0, 1);
+
+      const from = wpts[i], to = wpts[i+1];
+      if (token.mesh) {
+        token.mesh.position.set(
+          from.x + (to.x - from.x) * prof.ease(t),
+          from.y + (to.y - from.y) * prof.ease(t),
+        );
+        syncPos(token);
+        refreshDuringAnimation(token, i !== lastStep || gp >= 1);
+      }
+      lastStep = i;
+
+      if (gp >= 1) { canvas.app.ticker.remove(tick); res(); }
+    };
+    canvas.app.ticker.add(tick);
+  });
 }
 
 async function animTeleport(token, wpts, totalMs, bsx, bsy) {
