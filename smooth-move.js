@@ -249,10 +249,20 @@ Hooks.once("setup", () => {
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
           const last = j.pts[j.pts.length - 1];
           const real = track && j.docWPs?.length;
+          // Only the final waypoint may be a checkpoint. TokenDocument#splitMovementPath
+          // sets `split = current.checkpoint` and pushes everything after a checkpoint
+          // into `pending` — and pending is never executed, because we deliberately
+          // suppress core's animation with animate:false. The destination then becomes
+          // passed.at(-1), i.e. wherever the first checkpoint happened to be, which is
+          // why the token snapped back mid-path. Our journey has already been animated,
+          // so it must be committed whole, with no intermediate stopping points.
+          const wps = real
+            ? j.docWPs.map((w, idx) => ({ ...w, checkpoint: idx === j.docWPs.length - 1 }))
+            : null;
           movement[j.token.id] = {
             // Real path under its real action when measuring; otherwise a single
             // unmeasured displace hop, which is the long-proven stable commit.
-            waypoints: real ? j.docWPs : [{
+            waypoints: wps ?? [{
               x: last.x - tw/2, y: last.y - th/2,
               elevation: j.token.document.elevation ?? 0,
               width: j.token.document.width ?? 1,
