@@ -16,18 +16,6 @@ Hooks.once("init", () => {
     scope: "world", config: true,
     type: Boolean, default: false,
   });
-  game.settings.register(MODULE_ID, "trackMovement", {
-    name: "Record travelled distance (needs testing)",
-    hint: "Off by default. When on, drags commit under the token's real movement "
-        + "action so Foundry measures the distance and the combat movement counter "
-        + "advances. Distance can ONLY be measured this way — Foundry takes the "
-        + "'measure' flag from the action itself and ignores any value we set. An "
-        + "earlier attempt at this misbehaved; this one differs in how the commit is "
-        + "submitted. If a move starts from the wrong square or the camera jumps, "
-        + "turn this back off and the previous, stable behaviour returns immediately.",
-    scope: "world", config: true,
-    type: Boolean, default: false,
-  });
   game.settings.register(MODULE_ID, "sourceUpdates", {
     name: "Light and vision during movement",
     hint: "How often a moving token's light and vision are recalculated. Rebuilding "
@@ -237,18 +225,22 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
-        // Distance can only be measured if the committed waypoints carry a real
-        // movement action: TokenDocument sets waypoint.measure from the action's
-        // config (token.mjs ~1164) and the grid skips the entire distance/cost
-        // computation for measure:false (square.mjs ~507). A per-waypoint cost is
-        // read only INSIDE that gate, so there is no way to hand Foundry a number.
-        // "displace" is measure:false, hence zero distance with it.
-        const track = game.settings.get(MODULE_ID, "trackMovement") ?? false;
+        // Commit the player's real waypoints under their real movement action, so
+        // Foundry measures the journey. Distance can ONLY be recorded this way:
+        // TokenDocument takes waypoint.measure from the action's own config
+        // (token.mjs ~1164) and the grid skips the whole distance/cost computation
+        // when measure is false (square.mjs ~507), reading a per-waypoint cost only
+        // INSIDE that gate. "displace" is measure:false, so it always recorded zero.
+        //
+        // Verified in play: square grid gives distance 25 / spaces 5 for five
+        // squares, gridless gives the Euclidean length, and the per-turn total
+        // accumulates. (History itself is only kept for a combatant in a started
+        // combat — Token#_shouldRecordMovementHistory — which is core behaviour.)
         const movement = {};
         for (const j of jobs) {
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
           const last = j.pts[j.pts.length - 1];
-          const real = track && j.docWPs?.length;
+          const real = j.docWPs?.length;
           // Only the final waypoint may be a checkpoint. TokenDocument#splitMovementPath
           // sets `split = current.checkpoint` and pushes everything after a checkpoint
           // into `pending` — and pending is never executed, because we deliberately
@@ -260,8 +252,8 @@ Hooks.once("setup", () => {
             ? j.docWPs.map((w, idx) => ({ ...w, checkpoint: idx === j.docWPs.length - 1 }))
             : null;
           movement[j.token.id] = {
-            // Real path under its real action when measuring; otherwise a single
-            // unmeasured displace hop, which is the long-proven stable commit.
+            // Fallback to a single unmeasured displace hop only if core produced no
+            // waypoints for this token, which should not normally happen.
             waypoints: wps ?? [{
               x: last.x - tw/2, y: last.y - th/2,
               elevation: j.token.document.elevation ?? 0,
