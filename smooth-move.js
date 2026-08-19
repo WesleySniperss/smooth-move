@@ -16,6 +16,18 @@ Hooks.once("init", () => {
     scope: "world", config: true,
     type: Boolean, default: false,
   });
+  game.settings.register(MODULE_ID, "trackMovement", {
+    name: "Record travelled distance (needs testing)",
+    hint: "Off by default. When on, drags commit under the token's real movement "
+        + "action so Foundry measures the distance and the combat movement counter "
+        + "advances. Distance can ONLY be measured this way — Foundry takes the "
+        + "'measure' flag from the action itself and ignores any value we set. An "
+        + "earlier attempt at this misbehaved; this one differs in how the commit is "
+        + "submitted. If a move starts from the wrong square or the camera jumps, "
+        + "turn this back off and the previous, stable behaviour returns immediately.",
+    scope: "world", config: true,
+    type: Boolean, default: false,
+  });
   game.settings.register(MODULE_ID, "sourceUpdates", {
     name: "Light and vision during movement",
     hint: "How often a moving token's light and vision are recalculated. Rebuilding "
@@ -183,7 +195,9 @@ Hooks.once("setup", () => {
         // its destination from this last point, so the token would settle there
         // too. Pin it back to the real final waypoint.
         if (pts.length > 1) pts[pts.length - 1] = meshWPs[meshWPs.length - 1];
-        jobs.push({ token: t, pts, mode: tMode, upd });
+        // Core's own waypoints (document space, real action) — needed to commit a
+        // measured move; see the movement block below.
+        jobs.push({ token: t, pts, mode: tMode, upd, docWPs: tWPs });
       }
 
       if (!jobs.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
@@ -223,33 +237,36 @@ Hooks.once("setup", () => {
           setTimeout(() => { delete j.token._smCommitting; }, 500);
         }
 
-        // Commit as a single "displace" waypoint straight to the destination.
-        // displace is unmeasured (measure:false, costMultiplier:0), so travelled
-        // distance is NOT recorded — that is a deliberate trade, not an oversight.
-        //
-        // v3.2.0 committed the real waypoints under their real action instead,
-        // which does record distance. Reading the v14 source it looked safe: walls
-        // bypassed by constrainOptions.ignoreWalls, camera by pan:false, size by
-        // the waypoints carrying the token's own dimensions. In play it was not —
-        // moves began from the wrong point and the camera misbehaved, the same
-        // family of bugs displace was adopted to avoid. Reverted in v3.8.0.
-        //
-        // If this is ever revisited, start with `method`: "dragging" pulls the
-        // commit into core's drag and planned-movement machinery (showRuler,
-        // _plannedMovement, recalculatePlannedMovementPath), which a commit we
-        // have already animated ourselves has no business re-entering.
+        // Distance can only be measured if the committed waypoints carry a real
+        // movement action: TokenDocument sets waypoint.measure from the action's
+        // config (token.mjs ~1164) and the grid skips the entire distance/cost
+        // computation for measure:false (square.mjs ~507). A per-waypoint cost is
+        // read only INSIDE that gate, so there is no way to hand Foundry a number.
+        // "displace" is measure:false, hence zero distance with it.
+        const track = game.settings.get(MODULE_ID, "trackMovement") ?? false;
         const movement = {};
         for (const j of jobs) {
           const tw = j.token.w ?? 0, th = j.token.h ?? 0;
           const last = j.pts[j.pts.length - 1];
+          const real = track && j.docWPs?.length;
           movement[j.token.id] = {
-            waypoints: [{ x: last.x - tw/2, y: last.y - th/2,
+            // Real path under its real action when measuring; otherwise a single
+            // unmeasured displace hop, which is the long-proven stable commit.
+            waypoints: real ? j.docWPs : [{
+              x: last.x - tw/2, y: last.y - th/2,
               elevation: j.token.document.elevation ?? 0,
               width: j.token.document.width ?? 1,
               height: j.token.document.height ?? 1,
               shape: j.token.document.shape,
               action: "displace", snapped: false, explicit: true, checkpoint: true }],
+            // "api", never "dragging": dragging re-enters core's drag and
+            // planned-movement machinery for a move we have already animated.
             method: "api",
+            // Explicit. When planned is true TokenDocument sets the destination to
+            // the ORIGIN and strips x/y from the update entirely (token.mjs ~1833),
+            // which reads exactly like "the move started from the wrong square" —
+            // the symptom the previous attempt at this produced.
+            planned: false,
             constrainOptions: { ignoreWalls: true, ignoreCost: true },
             autoRotate: false,
             showRuler: false,
