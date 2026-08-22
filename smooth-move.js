@@ -40,8 +40,17 @@ Hooks.once("setup", () => {
 
   class SmoothMoveToken extends Base {
 
+    // Suppressed only while OUR ticker owns the mesh. Deliberately NOT during
+    // _smCommitting: core sets the refreshPosition flag when the commit lands,
+    // _applyRenderFlags consumes it whether or not we act on it, and nothing
+    // re-requests it afterwards. Swallowing it left this.position — the container
+    // that hitArea is relative to — out of step with the document, so the token
+    // could not be clicked directly while a marquee (which uses bounds) still
+    // caught it. It also skipped core's MouseInteractionManager.emulateMoveEvent().
+    // Since v3.9.0 the document already tracks the mesh during animation, so
+    // running it at commit time simply re-derives the same position authoritatively.
     _refreshPosition(...args) {
-      if (this._smActive || this._smCommitting) return;
+      if (this._smActive) return;
       return super._refreshPosition?.(...args);
     }
 
@@ -275,7 +284,16 @@ Hooks.once("setup", () => {
         await canvas.scene?.updateEmbeddedDocuments("Token", finalUpdates,
           { animate: false, pan: false, movement });
 
-        for (const j of jobs) syncPosAndPerception(j.token);
+        // Re-derive interaction state from the authoritative document. The commit's
+        // own refreshPosition flag may already have been consumed while
+        // _smCommitting was still set, and a stale container position leaves the
+        // token unclickable even though a marquee still selects it. refreshShape
+        // rebuilds hitArea, refreshState rebuilds eventMode; both call
+        // MouseInteractionManager.emulateMoveEvent so the cursor is re-evaluated.
+        for (const j of jobs) {
+          syncPosAndPerception(j.token);
+          j.token.renderFlags?.set({ refreshPosition: true, refreshShape: true, refreshState: true });
+        }
       })().catch(err => console.error("[smooth-move] animation error:", err))
         .finally(() => { this.layer._smGroupDrop = false; });
     }
@@ -322,6 +340,7 @@ Hooks.once("ready", () => {
       delete t._smCommitting;
       delete t._smBaseScale;
       delete t._smRunFt;
+      delete t._smStartedAt;
       delete t._smTick;
       if (t.mesh) t.mesh.alpha = 1;
     }
@@ -398,6 +417,32 @@ function documentScale(token) {
 const SIZE_WATCHDOG_FACTOR = 3;
 const SIZE_WATCHDOG_MS = 1000;
 
+// An animation that never resolves — its ticker removed by a scene change, an
+// exception in a profile — would leave _smActive set forever, and _refreshPosition
+// is suppressed while it is. The token then stops tracking its document: it can no
+// longer be clicked directly, though a marquee still selects it. Nothing should run
+// anywhere near this long, so treat it as stuck, release the mesh and rebuild the
+// interaction state from the document.
+const STUCK_ANIMATION_MS = 15000;
+
+function releaseStuckAnimations() {
+  for (const token of canvas.tokens?.placeables ?? []) {
+    if (!token._smActive) continue;
+    const started = token._smStartedAt ?? 0;
+    if (started && (performance.now() - started) < STUCK_ANIMATION_MS) continue;
+    console.warn(`[smooth-move] "${token.document?.name ?? token.id}" was left mid-animation `
+      + `and stopped responding to clicks — releasing it.`);
+    delete token._smActive;
+    delete token._smCommitting;
+    delete token._smStartedAt;
+    delete token._smBaseScale;
+    delete token._smRunFt;
+    delete token._smTick;
+    if (token.mesh) token.mesh.alpha = 1;
+    token.renderFlags?.set({ refreshPosition: true, refreshShape: true, refreshState: true });
+  }
+}
+
 function sizeWatchdogSweep() {
   for (const token of canvas.tokens?.placeables ?? []) {
     if (token._smActive || token._smCommitting) continue;  // our animation owns it
@@ -424,6 +469,7 @@ function startSizeWatchdog() {
     acc += canvas.app.ticker.deltaMS || 16.667;
     if (acc < SIZE_WATCHDOG_MS) return;
     acc = 0;
+    releaseStuckAnimations();
     sizeWatchdogSweep();
   };
   sizeWatchdogSweep._tick = tick;
@@ -834,6 +880,7 @@ async function animate(token, waypoints, mode) {
 
   const baseRot = token.mesh?.rotation ?? 0;
   token._smActive = true;
+  token._smStartedAt = performance.now();
   try {
     if (prof.kind === "walk") {
       const steps   = waypoints.length - 1;
@@ -846,6 +893,7 @@ async function animate(token, waypoints, mode) {
     else                               await animCont(token, waypoints, dur, prof, gs, bsx, bsy);
   } finally {
     delete token._smActive;
+    delete token._smStartedAt;
     delete token._smBaseScale;
     delete token._smRunFt;
     delete token._smTick;
