@@ -2,10 +2,10 @@
   "id": "smooth-move",
   "title": "Smooth Move",
   "description": "Tokens animate along the path you actually dragged, with a movement style per action — stepping walks, gliding flight, swimming wobble, burrowing, and a teleport effect for blinks. Right-click during a drag to anchor a waypoint. Paths are synced over the socket so every player sees the same motion, and fog of war stays correct mid-move. Travelled distance is measured and recorded as normal, so the combat movement counter works.",
-  "version": "3.16.0",
+  "version": "3.16.1",
   "compatibility": {
     "minimum": "14",
-    "verified": "14"
+    "verified": "14.367.0"
   },
   "socket": true,
   "esmodules": ["smooth-move.js"],
