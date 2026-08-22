@@ -170,14 +170,12 @@ Hooks.once("setup", () => {
         const skip    = Math.abs(first.x - tStart.x) < 2 && Math.abs(first.y - tStart.y) < 2;
         const raw     = skip ? [tStart, ...meshWPs.slice(1)] : [tStart, ...meshWPs];
         const tMode   = getMoveMode(t);
-        // Decide this from the resolved profile, not the action name: animate()
-        // dispatches on prof.kind, so keying on the name meant "jump" (and any
-        // action falling back to the walk profile) went to animWalk WITHOUT
-        // being split into cells — one giant bouncing stride per waypoint
-        // instead of a step per square, and a wrong _smRunFt for the dust FX.
+        // Whether the path is split into one point per grid square is a property
+        // of the profile, not of how it animates. Walking and climbing traverse
+        // squares; jumping crosses them, so it keeps the player's own waypoints
+        // and arcs between them instead of hopping over every cell in between.
         const tProf   = profileFor(tMode);
-        const stepped = tProf?.kind === "walk" || tProf?.kind === "step";
-        const pts     = stepped ? expandToGridCells(raw, t) : raw;
+        const pts     = tProf?.grid ? expandToGridCells(raw, t) : raw;
         // expandToGridCells snaps to cell centres, which would move an unsnapped
         // drop (shift-drag) up to half a cell off target — and the commit takes
         // its destination from this last point, so the token would settle there
@@ -755,17 +753,18 @@ function spawnSwimBubble(layer, x, y, dirX, dirY, tr) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const PROFILES = {
-  walk:   { kind: "walk",   mult: 1.0 },
+  walk:   { kind: "walk",   mult: 1.0, grid: true },
   fly:    { kind: "cont",   mult: 1.0, ease: eio4,
             scale: t => 1 + 0.10 * Math.sin(Math.PI * t) },
   swim:   { kind: "cont",   mult: 2.0, ease: eio,
             ox: (t, gs) => Math.sin(t * Math.PI * 4) * gs * 0.07,
             oy: (t, gs) => Math.sin(t * Math.PI * 8) * gs * 0.035,
             effect: spawnSwimBubble, effectHz: 6 },
-  climb:  { kind: "step",   mult: 1.2, ease: eio, pause: 80 },
+  climb:  { kind: "step",   mult: 1.2, ease: eio, pause: 80, grid: true },
   crawl:  { kind: "cont",   mult: 1.0, ease: eio },
   burrow: { kind: "cont",   mult: 2.0, ease: eio },
-  jump:   { kind: "walk",   mult: 1.0 },
+  jump:   { kind: "step",   mult: 0.9, ease: eio, pause: 0,
+            oy: (t, gs) => -Math.sin(Math.PI * t) * gs * 0.45 },
   teleport: { kind: "teleport", mult: 0.8 },
   blink:    { kind: "teleport", mult: 0.8 },
   tp:       { kind: "teleport", mult: 0.8 },
@@ -842,7 +841,7 @@ async function animate(token, waypoints, mode) {
       token._smRunFt = totalFt;
       await animWalk(token, waypoints, totalFt > 30 ? 1300 : 1000, bsx, bsy, baseRot);
     }
-    else if (prof.kind === "step")     await animStep(token, waypoints, dur, prof);
+    else if (prof.kind === "step")     await animStep(token, waypoints, dur, prof, gs);
     else if (prof.kind === "teleport") await animTeleport(token, waypoints, dur, bsx, bsy);
     else                               await animCont(token, waypoints, dur, prof, gs, bsx, bsy);
   } finally {
@@ -1981,7 +1980,7 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
 // climb's deliberate pause between steps is folded into the timeline rather
 // than being a setTimeout between awaited steps, which drifted twice over: once
 // per step boundary and once per timer.
-function animStep(token, wpts, totalMs, prof) {
+function animStep(token, wpts, totalMs, prof, gs = 100) {
   const steps  = Math.max(wpts.length - 1, 1);
   const stepMs = totalMs / steps;
   const pause  = prof.pause ?? 65;
@@ -2001,9 +2000,12 @@ function animStep(token, wpts, totalMs, prof) {
 
       const from = wpts[i], to = wpts[i+1];
       if (token.mesh) {
+        // ox/oy are applied per step, so a jump arcs over each segment rather
+        // than describing one long arc across the whole path.
+        const e = prof.ease(t);
         token.mesh.position.set(
-          from.x + (to.x - from.x) * prof.ease(t),
-          from.y + (to.y - from.y) * prof.ease(t),
+          from.x + (to.x - from.x) * e + (prof.ox?.(t, gs) ?? 0),
+          from.y + (to.y - from.y) * e + (prof.oy?.(t, gs) ?? 0),
         );
         syncPos(token);
         refreshDuringAnimation(token, i !== lastStep || gp >= 1);
