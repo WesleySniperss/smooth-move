@@ -59,19 +59,37 @@ Hooks.once("setup", () => {
     // (see Token##onUpdateAnimation). Suppress only that animation while our own
     // ticker owns the mesh — other animations (alpha, bars, texture, ring) must
     // still run normally, so we key on the name rather than blocking everything.
+    //
+    // Not during _smCommitting. Our commit is animate:false, and core only dispatches
+    // a movement animation for animate !== false, so the flag never caught our own
+    // commit — only a genuine move landing in the 500ms after it (an arrow-key nudge,
+    // a core movement continuation). Swallowing that left the mesh where it was while
+    // the document had moved on: this client showed the token in one place, everyone
+    // else in another.
     animate(to, options = {}) {
-      if ((this._smActive || this._smCommitting)
-          && options.name === this.movementAnimationName) {
+      if (this._smActive && options.name === this.movementAnimationName) {
         return Promise.resolve();
       }
       return super.animate(to, options);
     }
 
     _onUpdate(data, options, userId) {
+      const hasPos = data.x != null || data.y != null;
+
+      // The document moved while our ticker owned the mesh. The ticker keeps writing
+      // its own path into the prepared document until it finishes, so without this
+      // it would end on ITS destination, not the one just committed — permanently,
+      // since nothing re-derives it afterwards. animate() settles on _source when set.
+      if (hasPos && this._smActive) this._smSourceMoved = true;
+
       if (this._smCommitting) {
         super._onUpdate(data, options, userId);
         canvas.tokens?.recalculatePlannedMovementPaths?.();
-        syncPosAndPerception(this);
+        // From the document, never from the mesh: the update has just re-prepared
+        // the document from _source, which is the committed position — the one every
+        // other client now has. Copying the mesh back over it made this client keep
+        // whatever the animation ended on whenever core committed somewhere else.
+        refreshPerception(this);
         return;
       }
 
@@ -79,7 +97,6 @@ Hooks.once("setup", () => {
       // Socket message already started animation on this client; if _smActive is true
       // the animation is running and we just let super._onUpdate update the document.
       // If _smActive is false the socket didn't arrive in time — animate a direct line.
-      const hasPos = data.x != null || data.y != null;
       if (hasPos && !this._smActive && options?.animate === false) {
         const startX = this.mesh?.position.x;
         const startY = this.mesh?.position.y;
@@ -191,13 +208,21 @@ Hooks.once("setup", () => {
         // too. Pin it back to the real final waypoint.
         if (pts.length > 1) pts[pts.length - 1] = meshWPs[meshWPs.length - 1];
         // Core's own waypoints (document space, real action) — needed to commit a
-        // measured move; see the movement block below.
-        jobs.push({ token: t, pts, mode: tMode, upd, docWPs: tWPs });
+        // measured move; see the movement block below. The size is captured now
+        // because Token#w reads the grid of whatever scene is on the canvas, which
+        // by commit time may no longer be this one.
+        jobs.push({ token: t, pts, mode: tMode, upd, docWPs: tWPs, tw, th });
       }
 
       if (!jobs.length) { delete this._smStartPx; return super._onDragLeftDrop(event, ...args); }
 
       const capturedUpdates = tokenUpdates;
+      // The scene these tokens live in, fixed at drop time. The commit lands a full
+      // animation later, and canvas.scene is whatever is being viewed by then: switch
+      // scenes mid-move and the update went to the wrong scene and failed, so every
+      // player kept the token at the destination while the server still had it at
+      // the origin.
+      const scene = this.document.parent ?? canvas.scene;
       this.layer._smGroupDrop = true;
 
       (async () => {
@@ -224,8 +249,7 @@ Hooks.once("setup", () => {
           const job = jobs.find(j => j.token.id === tid);
           if (!job) return upd;
           const last = job.pts[job.pts.length - 1];
-          const tw = job.token.w ?? 0, th = job.token.h ?? 0;
-          return { ...upd, x: last.x - tw/2, y: last.y - th/2 };
+          return { ...upd, x: last.x - job.tw/2, y: last.y - job.th/2 };
         });
         for (const j of jobs) {
           j.token._smCommitting = true;
@@ -245,7 +269,7 @@ Hooks.once("setup", () => {
         // combat — Token#_shouldRecordMovementHistory — which is core behaviour.)
         const movement = {};
         for (const j of jobs) {
-          const tw = j.token.w ?? 0, th = j.token.h ?? 0;
+          const { tw, th } = j;
           const last = j.pts[j.pts.length - 1];
           const real = j.docWPs?.length;
           // Only the final waypoint may be a checkpoint. TokenDocument#splitMovementPath
@@ -281,18 +305,17 @@ Hooks.once("setup", () => {
             showRuler: false,
           };
         }
-        await canvas.scene?.updateEmbeddedDocuments("Token", finalUpdates,
-          { animate: false, pan: false, movement });
-
-        // Re-derive interaction state from the authoritative document. The commit's
-        // own refreshPosition flag may already have been consumed while
-        // _smCommitting was still set, and a stale container position leaves the
-        // token unclickable even though a marquee still selects it. refreshShape
-        // rebuilds hitArea, refreshState rebuilds eventMode; both call
-        // MouseInteractionManager.emulateMoveEvent so the cursor is re-evaluated.
-        for (const j of jobs) {
-          syncPosAndPerception(j.token);
-          j.token.renderFlags?.set({ refreshPosition: true, refreshShape: true, refreshState: true });
+        // Settle on _source whatever happened. On success it is the committed
+        // position, normally exactly where the animation ended, and this only
+        // rebuilds interaction state (see settleOnSource). If core committed
+        // somewhere else, or the update was rejected or threw, the token goes where
+        // the server actually has it — which is where every other client shows it —
+        // instead of staying parked on an animation nobody else agrees with.
+        try {
+          await scene?.updateEmbeddedDocuments("Token", finalUpdates,
+            { animate: false, pan: false, movement });
+        } finally {
+          for (const j of jobs) settleOnSource(j.token);
         }
       })().catch(err => console.error("[smooth-move] animation error:", err))
         .finally(() => { this.layer._smGroupDrop = false; });
@@ -342,6 +365,9 @@ Hooks.once("ready", () => {
       delete t._smRunFt;
       delete t._smStartedAt;
       delete t._smTick;
+      delete t._smTouched;
+      delete t._smSourceMoved;
+      delete t._smDriftSince;
       if (t.mesh) t.mesh.alpha = 1;
     }
     TokenEffects.instance.destroy();
@@ -438,8 +464,42 @@ function releaseStuckAnimations() {
     delete token._smBaseScale;
     delete token._smRunFt;
     delete token._smTick;
+    delete token._smSourceMoved;
     if (token.mesh) token.mesh.alpha = 1;
-    token.renderFlags?.set({ refreshPosition: true, refreshShape: true, refreshState: true });
+    // Snap, not glide: whatever wedged this animation could wedge a new one too.
+    settleOnSource(token, { glide: false });
+  }
+}
+
+// Backstop for every case settleOnSource was not reached for: a commit that never
+// arrived (rejected, failed, the mover's window hidden so their animation never
+// finished), or a path nobody has thought of yet. A token we animated whose shown
+// position disagrees with _source for longer than any commit could still be in
+// flight is put back where the server has it, with a warning naming it — so a
+// desync can last a few seconds, not the rest of the session. Only tokens this
+// module has animated are checked; anything else is another module's business.
+const DRIFT_GRACE_MS = 3000;
+
+function settleDriftedTokens() {
+  const now = performance.now();
+  for (const token of canvas.tokens?.placeables ?? []) {
+    if (!token._smTouched) continue;
+    const doc = token.document, src = doc?._source;
+    const busy = token._smActive || token._smCommitting || token._smStartPx
+      || token.isPreview || token.animationContexts?.size;
+    // Both the prepared document and the container (Token#x/y, what _refreshPosition
+    // sets): an update can re-prepare the document while the container stays put.
+    const off = !!src && !busy && (
+         Math.abs(doc.x - src.x) > 1 || Math.abs(doc.y - src.y) > 1
+      || Math.abs(token.x - src.x) > 1 || Math.abs(token.y - src.y) > 1);
+    if (!off) { delete token._smDriftSince; continue; }
+    token._smDriftSince ??= now;
+    if (now - token._smDriftSince < DRIFT_GRACE_MS) continue;
+    delete token._smDriftSince;
+    console.warn(`[smooth-move] "${doc.name ?? token.id}" was shown at `
+      + `(${Math.round(token.x)}, ${Math.round(token.y)}) but is at (${src.x}, ${src.y}) `
+      + `for everyone else — moving it there.`);
+    settleOnSource(token);
   }
 }
 
@@ -470,6 +530,7 @@ function startSizeWatchdog() {
     if (acc < SIZE_WATCHDOG_MS) return;
     acc = 0;
     releaseStuckAnimations();
+    settleDriftedTokens();
     sizeWatchdogSweep();
   };
   sizeWatchdogSweep._tick = tick;
@@ -483,9 +544,18 @@ function stopSizeWatchdog() {
   delete sizeWatchdogSweep._tick;
 }
 
+// A token whose canvas was torn down (scene switched mid-move) keeps its mesh
+// reference, but the mesh is destroyed and its transform gone — touching
+// mesh.position or mesh.scale throws. In animate()'s finally that threw before
+// the commit was ever sent, which lost the move on the server while every player
+// had already watched it arrive.
+function hasMesh(token) {
+  return !!token?.mesh && !token.mesh.destroyed;
+}
+
 function syncPos(token) {
+  if (!hasMesh(token)) return;
   const mesh = token.mesh;
-  if (!mesh) return;
   const x = mesh.position.x - (token.w ?? 0) / 2;
   const y = mesh.position.y - (token.h ?? 0) / 2;
   Object.assign(token, { x, y });
@@ -507,8 +577,53 @@ function syncPos(token) {
 
 function syncPosAndPerception(token) {
   syncPos(token);
+  refreshPerception(token);
+}
+
+function refreshPerception(token) {
   token.initializeSources?.();
   canvas.perception?.update({ refreshVision: true });
+}
+
+// Every write syncPos makes goes to the PREPARED document; _source is what the
+// server has and what every other client is drawing. The two may only differ
+// while one of our animations or our own commit is in flight. Once both are
+// done, hand the token back to _source: snap if the mesh already ended there
+// (the normal case — nothing visibly changes), glide there if it did not.
+//
+// Nothing else does this. A document update re-prepares from _source, but any
+// animation still ticking writes its own path straight back over it, and the
+// render flag the update raised has already been consumed while _refreshPosition
+// was suppressed. Without this the token stays wherever that animation ended,
+// indefinitely, while every other client has it somewhere else.
+function settleOnSource(token, { glide = true } = {}) {
+  if (token?.destroyed || token._smActive || !hasMesh(token)) return;
+  const doc = token.document, src = doc?._source;
+  if (!src) return;
+  const w = token.w ?? 0, h = token.h ?? 0;
+  const from = { x: token.mesh.position.x, y: token.mesh.position.y };
+  const to   = { x: src.x + w/2, y: src.y + h/2 };
+  doc.x = src.x; doc.y = src.y;
+  // Rebuild position, hitArea and eventMode from the document regardless of what
+  // the render loop already consumed — a stale container leaves the token
+  // unclickable while a marquee (which uses bounds) still selects it. Both
+  // refreshShape and refreshState call MouseInteractionManager.emulateMoveEvent.
+  // If the glide below starts, it owns the mesh by the time these flags apply
+  // and _refreshPosition stands down; if animate() declines (duration 0, an
+  // unanimated action) they snap the token instead. refreshVisibility because a
+  // snap can land it somewhere this viewer cannot see.
+  token.renderFlags?.set({ refreshPosition: true, refreshShape: true, refreshState: true,
+                           refreshVisibility: true });
+  // "pending": core split the path at a region with enter/exit behaviours, stopped
+  // the token at the boundary and is about to continue it on its own. Gliding back
+  // to that boundary only for core to carry it forward again is a pointless
+  // round trip; snap, and let core's continuation animate the rest.
+  const pending = doc.movement?.state === "pending";
+  if (!glide || pending || (Math.abs(from.x - to.x) < 2 && Math.abs(from.y - to.y) < 2)) {
+    refreshPerception(token);
+    return;
+  }
+  animate(token, [from, to], getMoveMode(token)).catch(() => {});
 }
 
 // Recompute whether the mesh should be visible to THIS client at the token's
@@ -881,6 +996,8 @@ async function animate(token, waypoints, mode) {
   const baseRot = token.mesh?.rotation ?? 0;
   token._smActive = true;
   token._smStartedAt = performance.now();
+  token._smTouched = true;   // opts this token into the drift sweep
+  delete token._smSourceMoved;
   try {
     if (prof.kind === "walk") {
       const steps   = waypoints.length - 1;
@@ -897,11 +1014,33 @@ async function animate(token, waypoints, mode) {
     delete token._smBaseScale;
     delete token._smRunFt;
     delete token._smTick;
-    if (token.mesh) { token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy); }
-    // Re-derive the final size from the document so any drift can't persist —
-    // but only once the texture is loaded, or resize would compute a giant scale.
-    if (meshTextureReady(token)) { try { token._refreshSize?.(); } catch (_) {} }
-    syncPosAndPerception(token);
+    // A destroyed token is skipped entirely: initializeSources on it would
+    // re-create the light and vision sources core just tore down.
+    if (!token.destroyed && hasMesh(token)) {
+      token.mesh.alpha = 1; token.mesh.rotation = baseRot; token.mesh.scale.set(bsx, bsy);
+      // Re-derive the final size from the document so any drift can't persist —
+      // but only once the texture is loaded, or resize would compute a giant scale.
+      if (meshTextureReady(token)) { try { token._refreshSize?.(); } catch (_) {} }
+      // The document moved while we animated: the commit for this very move (then
+      // _source is where we just ended and settling changes nothing), or a newer
+      // move whose path we never got because we were busy — the socket handler
+      // drops a path that arrives mid-animation. That second case is a player
+      // whose window was hidden or stalled while the GM moved the same token
+      // twice: rendering pauses, both commits land, and on return this animation
+      // finished on the FIRST destination and stayed there.
+      //
+      // settleOnSource does the perception update itself (or its glide does), so
+      // only one of the two branches rebuilds sources. For viewers this is the
+      // common branch — the commit usually lands mid-animation — and running both
+      // rebuilt every light and vision source twice per move.
+      if (token._smSourceMoved) {
+        delete token._smSourceMoved;
+        syncPos(token);
+        settleOnSource(token);
+      } else {
+        syncPosAndPerception(token);
+      }
+    }
   }
 }
 
@@ -1926,7 +2065,7 @@ function animWalk(token, wpts, totalMs, bsx, bsy, baseRot = 0) {
       const rTgt = clamp(svx * 0.04, -Math.PI / 10, Math.PI / 10);
       rot += (rTgt - rot) * clamp(4 * dt, 0, 1);
 
-      if (token.mesh) {
+      if (hasMesh(token)) {
         token.mesh.position.set(fx + dx * ek, fy + dy * ek);
         token.mesh.scale.set(bsx * E, bsy * E);
         token.mesh.rotation = baseRot + rot;
@@ -2004,7 +2143,7 @@ function animCont(token, wpts, totalMs, prof, gs, bsx = 1, bsy = 1) {
         }
       }
 
-      if (token.mesh) {
+      if (hasMesh(token)) {
         token.mesh.position.set(
           pos.x + (prof.ox?.(t, gs) ?? 0),
           pos.y + (prof.oy?.(t, gs) ?? 0),
@@ -2047,7 +2186,7 @@ function animStep(token, wpts, totalMs, prof, gs = 100) {
       const t  = clamp((elapsed - (i * span)) / mvMs, 0, 1);
 
       const from = wpts[i], to = wpts[i+1];
-      if (token.mesh) {
+      if (hasMesh(token)) {
         // ox/oy are applied per step, so a jump arcs over each segment rather
         // than describing one long arc across the whole path.
         const e = prof.ease(t);
@@ -2099,7 +2238,7 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
       gfx.clear(); drawParts(src.x,src.y,eK*gs*0.65,1-eK);
       gfx.lineStyle(2.5,CORE,(1-eK)*0.7); gfx.drawCircle(src.x,src.y,(1-eK*0.5)*gs*0.45); gfx.lineStyle(0);
       drawTrail(k);
-      if(token.mesh){token.mesh.alpha=1-eK;token.mesh.scale.set(bsx*(1-k*0.15),bsy*(1-k*0.15));syncPos(token);}
+      if(hasMesh(token)){token.mesh.alpha=1-eK;token.mesh.scale.set(bsx*(1-k*0.15),bsy*(1-k*0.15));syncPos(token);}
       if(k>=1){canvas.app.ticker.remove(tick);res();}
     };
     canvas.app.ticker.add(tick);
@@ -2108,7 +2247,7 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
   // The token is now at the destination. Re-test fog before it fades back in,
   // otherwise a token blinking somewhere the viewer cannot see would visibly
   // materialise there and only be hidden once the animation released the mesh.
-  if(token.mesh){token.mesh.alpha=0;token.mesh.position.set(dest.x,dest.y);syncPos(token);refreshDuringAnimation(token,true);} gfx.clear();
+  if(hasMesh(token)){token.mesh.alpha=0;token.mesh.position.set(dest.x,dest.y);syncPos(token);refreshDuringAnimation(token,true);} gfx.clear();
 
   await new Promise(res => {
     const t0=performance.now();
@@ -2122,7 +2261,7 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
     canvas.app.ticker.add(tick);
   });
 
-  if(token.mesh){token.mesh.alpha=0;} gfx.clear(); trail.clear();
+  if(hasMesh(token)){token.mesh.alpha=0;} gfx.clear(); trail.clear();
 
   await new Promise(res => {
     const t0=performance.now();
@@ -2130,7 +2269,7 @@ async function animTeleport(token, wpts, totalMs, bsx, bsy) {
       const k=clamp((performance.now()-t0)/inMs,0,1), eK=eio4(k);
       gfx.clear(); drawParts(dest.x,dest.y,eK*gs*0.65*(1-k),k);
       gfx.lineStyle(2.5,CORE,k*0.85); gfx.drawCircle(dest.x,dest.y,eK*gs*0.45); gfx.lineStyle(0);
-      if(token.mesh){token.mesh.alpha=k;token.mesh.scale.set(bsx*(0.88+k*0.12),bsy*(0.88+k*0.12));syncPos(token);}
+      if(hasMesh(token)){token.mesh.alpha=k;token.mesh.scale.set(bsx*(0.88+k*0.12),bsy*(0.88+k*0.12));syncPos(token);}
       if(k>=1){canvas.app.ticker.remove(tick);res();}
     };
     canvas.app.ticker.add(tick);
