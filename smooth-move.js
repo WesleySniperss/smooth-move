@@ -508,6 +508,8 @@ function sizeWatchdogSweep() {
     if (token._smActive || token._smCommitting) continue;  // our animation owns it
     if (token.isPreview) continue;                         // drag ghost
     if (token.animationContexts?.size) continue;           // core is animating it
+    // isometric-perspective sizes these on purpose (perspective scenes, full-height standing art)
+    if (game.modules.get("isometric-perspective")?.api?.perspective?.managesToken?.(token)) continue;
     const mesh = token.mesh;
     if (!mesh) continue;
     const ds = documentScale(token);                       // null until texture loads
@@ -724,6 +726,12 @@ function getMoveMode(token) {
 }
 
 function expandToGridCells(pts, token) {
+  // Perspective scenes of isometric-perspective have their own cells, smaller towards the horizon
+  const perspective = game.modules.get("isometric-perspective")?.api?.perspective;
+  if (perspective?.isActive?.()) {
+    const cells = perspective.expandPath(pts, token);
+    if (cells) return cells;
+  }
   const gs = canvas.grid.size ?? 100;
   const w  = token.w ?? gs, h = token.h ?? gs;
   const toCell = px => ({ col: Math.round((px.x - w/2) / gs), row: Math.round((px.y - h/2) / gs) });
